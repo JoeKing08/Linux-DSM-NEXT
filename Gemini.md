@@ -273,10 +273,111 @@ void dsm_universal_register(void *ptr, size_t size) {
 *目标：高性能玩游戏，无定制内核。*
 
 1.  **宿主机 (Ubuntu 22.04) 操作：**
-    *   **安装依赖：** `apt install python2 libglib2.0-dev ...`。
+    *   **安装依赖：** `apt install build-essential pkg-config git zlib1g-dev python2 \
+    libglib2.0-dev libpixman-1-dev libfdt-dev libcap-dev libattr1-dev libsdl1.2-dev`。
     *   **系统调优：** `echo always > /sys/kernel/mm/transparent_hugepage/enabled` 和 `ulimit -r 99`。
     *   **编译 QEMU：** 同样源码，`./configure --target-list=x86_64-softmmu --enable-kvm --disable-werror`，然后 `make`。
-    *   **服务端准备：** 在提供内存的机器上运行 `python3 memory_server.py` (脚本同前文)。
+    *   **服务端准备：** 在提供内存的机器上运行 `python3 memory_server.py` 。
+        
+        ```python
+        import socket
+        import struct
+        import threading
+        import os
+
+        # === 配置区 ===
+        HOST = '0.0.0.0'        # 监听所有网卡
+        PORT = 9999             # 必须与 QEMU 中的端口一致
+        PAGE_SIZE = 4096
+        PREFETCH = 32           # 必须与 QEMU 中的 PREFETCH_COUNT 一致
+        MEM_FILE = "physical_ram.img"
+        MEM_SIZE = 32 * 1024 * 1024 * 1024  # 32GB (根据你硬盘大小调整)
+
+        # 协议头 (必须与 dsm_backend.c 一致)
+        PROTO_ZERO = b'\xAA'
+        PROTO_DATA = b'\xBB'
+        ZERO_BLOCK = b'\x00' * PAGE_SIZE
+
+        # === 初始化内存文件 ===
+        if not os.path.exists(MEM_FILE):
+            print(f"[*] Creating {MEM_SIZE // 1024**3}GB sparse memory file...")
+            with open(MEM_FILE, "wb") as f:
+                f.seek(MEM_SIZE - 1)
+                f.write(b'\0')
+            print("[*] File created.")
+
+        def handle_client(conn, addr):
+            # TCP 性能调优：禁用 Nagle 算法，增大缓冲区
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+            except:
+                pass
+
+            print(f"[+] Worker connected from {addr}")
+    
+            # 每个线程独立打开文件句柄，避免多线程 seek 竞争
+            f = open(MEM_FILE, "r+b")
+    
+            try:
+                while True:
+                    # 1. 接收请求：8字节地址
+                    data = conn.recv(8)
+                    if not data: break
+            
+                    # 解析地址 (Big Endian unsigned long long)
+                    base_addr = struct.unpack('>Q', data)[0]
+            
+                    # 2. 读取数据：一次性读 32 页 (128KB)
+                    f.seek(base_addr)
+                    chunk = f.read(PAGE_SIZE * PREFETCH)
+            
+                    # 如果读到文件末尾不足 32 页，补 0 防止崩溃
+                    if len(chunk) < PAGE_SIZE * PREFETCH:
+                        chunk += b'\x00' * (PAGE_SIZE * PREFETCH - len(chunk))
+            
+                    # 3. 发送响应
+                    for i in range(PREFETCH):
+                        # 切片获取当前页
+                        page_data = chunk[i*PAGE_SIZE : (i+1)*PAGE_SIZE]
+                
+                        # 零页优化：如果是全0，只发 1 字节协议头
+                        if page_data == ZERO_BLOCK:
+                            conn.sendall(PROTO_ZERO)
+                        else:
+                            # 数据页：协议头 + 4096字节数据
+                            conn.sendall(PROTO_DATA + page_data)
+                    
+            except Exception as e:
+                print(f"[-] Error with {addr}: {e}")
+            finally:
+                f.close()
+                conn.close()
+
+        def start_server():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((HOST, PORT))
+            except PermissionError:
+                print(f"[!] Error: Port {PORT} is denied. Try sudo?")
+                return
+
+            s.listen(100) # 允许大量并发连接
+            print(f"[*] ULTIMATE Memory Server listening on {PORT}")
+            print(f"[*] Serving file: {MEM_FILE}")
+
+            while True:
+                conn, addr = s.accept()
+                # 为每个连接启动独立线程
+                t = threading.Thread(target=handle_client, args=(conn, addr))
+                t.daemon = True
+                t.start()
+
+        if __name__ == '__main__':
+            start_server()
+        ```
+
     *   **启动：**
         *   **确保**没有加载 `giantvm-kvm.ko`。
         *   **命令：**
