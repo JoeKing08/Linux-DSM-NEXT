@@ -9,7 +9,7 @@
 
 请进入你的 GiantVM 源码根目录，依次进行以下操作。
 
-#### 1. 修改 `hw/tpm/tpm_tis.c` (修复万节点崩溃 Bug)
+#### 1. 修改 `hw/tpm/tpm_util.c` (修复万节点崩溃 Bug)
 **操作：** 找到 `tpm_util_test` 函数，**完全替换**为以下代码（记得在文件头部添加 `#include <poll.h>`）：
 
 ```c
