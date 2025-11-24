@@ -42,8 +42,34 @@
     *   **修改后：** `bitmap_zero(dsm_get_copyset(slot, vfn)->bits, DSM_MAX_INSTANCES);`
 
 *   **位置：** `kvm_dsm_invalidate` 函数中的循环
-    *   **原代码：** `for_each_set_bit(holder, copyset, DSM_MAX_INSTANCES) {`
-    *   **修改后：** `for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {`
+    *   **原代码：**
+        ```c
+        for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
+		// ... 构造请求 ...
+		
+		// 发送网络包
+		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
+		if (ret < 0) return ret;
+	    }
+        ```
+    *   **修改后：**
+        ```c
+        #include <linux/sched.h> // 确保引入调度头文件
+
+        // ...
+
+	        for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
+		        // ... 构造请求 ...
+		
+		        // 发送网络包
+		        ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
+		        if (ret < 0) return ret;
+
+		        /* [新增] 魔法作弊行：防止内核认为死锁 */
+		        /* 如果有更高优先级的任务，或者时间片用完，主动让出 CPU */
+		        cond_resched(); 
+	        }
+        ```
 
 *   **位置：** `dsm_handle_write_req` 函数 (多处)
     *   **原代码：** `clear_bit(kvm->arch.dsm_id, &resp.inv_copyset);`
