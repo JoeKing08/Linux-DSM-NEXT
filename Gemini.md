@@ -45,11 +45,11 @@
     *   **原代码：**
         ```c
         for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
-		// ... 构造请求 ...
+		    // ... 构造请求 ...
 		
-		// 发送网络包
-		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
-		if (ret < 0) return ret;
+		    // 发送网络包
+		    ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
+		    if (ret < 0) return ret;
 	    }
         ```
     *   **修改后：**
