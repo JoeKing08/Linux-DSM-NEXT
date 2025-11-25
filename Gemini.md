@@ -423,7 +423,7 @@ void dsm_universal_register(void *ptr, size_t size) {
 *   在 `ram_block_add` 函数结束前添加 `if (new_block->host) dsm_universal_register(new_block->host, new_block->max_length);`。
 
 **6. 文件：`Makefile.objs`**
-*   添加 `common-obj-y += dsm_backend.o`。
+*   `common-obj-y += vl.o` 后添加 `common-obj-y += dsm_backend.o`。
 
 ---
 
@@ -455,95 +455,94 @@ void dsm_universal_register(void *ptr, size_t size) {
     *   `./configure --target-list=x86_64-softmmu --enable-kvm --disable-werror && make -j`。
 3.  **运行服务端:**
     *   运行 `python3 memory_server.py`。
+        ```python
+        import socket
+        import struct
+        import threading
+        import os
 
-```python
-import socket
-import struct
-import threading
-import os
+        # === 配置区 ===
+        HOST = '0.0.0.0'
+        PORT = 9999
+        PAGE_SIZE = 4096
+        PREFETCH = 32  # 必须与 dsm_backend.c 中的 PREFETCH_COUNT 一致
+        MEM_FILE = "physical_ram.img"
+        MEM_SIZE = 32 * 1024 * 1024 * 1024  # 32GB (根据需求调整)
 
-# === 配置区 ===
-HOST = '0.0.0.0'
-PORT = 9999
-PAGE_SIZE = 4096
-PREFETCH = 32  # 必须与 dsm_backend.c 中的 PREFETCH_COUNT 一致
-MEM_FILE = "physical_ram.img"
-MEM_SIZE = 32 * 1024 * 1024 * 1024  # 32GB (根据需求调整)
+        # 协议头 (必须与 dsm_backend.c 一致)
+        PROTO_ZERO = b'\xAA'
+        PROTO_DATA = b'\xBB'
+        ZERO_BLOCK = b'\x00' * PAGE_SIZE
 
-# 协议头 (必须与 dsm_backend.c 一致)
-PROTO_ZERO = b'\xAA'
-PROTO_DATA = b'\xBB'
-ZERO_BLOCK = b'\x00' * PAGE_SIZE
+        # 初始化大文件
+        if not os.path.exists(MEM_FILE):
+            print(f"[*] Creating {MEM_SIZE // 1024**3}GB memory file...")
+            with open(MEM_FILE, "wb") as f:
+                f.seek(MEM_SIZE - 1)
+                f.write(b'\0')
+            print("[*] File created.")
 
-# 初始化大文件
-if not os.path.exists(MEM_FILE):
-    print(f"[*] Creating {MEM_SIZE // 1024**3}GB memory file...")
-    with open(MEM_FILE, "wb") as f:
-        f.seek(MEM_SIZE - 1)
-        f.write(b'\0')
-    print("[*] File created.")
+        def handle_client(conn, addr):
+            # TCP 调优
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+            except:
+                pass
 
-def handle_client(conn, addr):
-    # TCP 调优
-    try:
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-    except:
-        pass
-
-    print(f"[+] Connection from {addr}")
+            print(f"[+] Connection from {addr}")
     
-    # 每个线程独立打开文件句柄，避免 seek 竞争
-    f = open(MEM_FILE, "r+b")
+            # 每个线程独立打开文件句柄，避免 seek 竞争
+            f = open(MEM_FILE, "r+b")
     
-    try:
-        while True:
-            # 1. 接收请求
-            data = conn.recv(8)
-            if not data: break
+            try:
+                while True:
+                    # 1. 接收请求
+                    data = conn.recv(8)
+                    if not data: break
             
-            # 解析地址
-            base_addr = struct.unpack('>Q', data)[0]
+                    # 解析地址
+                    base_addr = struct.unpack('>Q', data)[0]
             
-            # 2. 预读数据
-            f.seek(base_addr)
-            chunk = f.read(PAGE_SIZE * PREFETCH)
+                    # 2. 预读数据
+                    f.seek(base_addr)
+                    chunk = f.read(PAGE_SIZE * PREFETCH)
             
-            # 如果读到文件末尾不足，补零
-            if len(chunk) < PAGE_SIZE * PREFETCH:
-                chunk += b'\x00' * (PAGE_SIZE * PREFETCH - len(chunk))
+                    # 如果读到文件末尾不足，补零
+                    if len(chunk) < PAGE_SIZE * PREFETCH:
+                        chunk += b'\x00' * (PAGE_SIZE * PREFETCH - len(chunk))
             
-            # 3. 分片发送
-            for i in range(PREFETCH):
-                page_data = chunk[i*PAGE_SIZE : (i+1)*PAGE_SIZE]
+                    # 3. 分片发送
+                    for i in range(PREFETCH):
+                        page_data = chunk[i*PAGE_SIZE : (i+1)*PAGE_SIZE]
                 
-                if page_data == ZERO_BLOCK:
-                    conn.sendall(PROTO_ZERO)
-                else:
-                    conn.sendall(PROTO_DATA + page_data)
+                        if page_data == ZERO_BLOCK:
+                            conn.sendall(PROTO_ZERO)
+                        else:
+                            conn.sendall(PROTO_DATA + page_data)
                     
-    except Exception as e:
-        print(f"[-] Error {addr}: {e}")
-    finally:
-        f.close()
-        conn.close()
+            except Exception as e:
+                print(f"[-] Error {addr}: {e}")
+            finally:
+                f.close()
+                conn.close()
 
-def start_server():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST, PORT))
-    s.listen(100)
-    print(f"[*] ULTIMATE Memory Server listening on {PORT}")
+        def start_server():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((HOST, PORT))
+            s.listen(100)
+            print(f"[*] ULTIMATE Memory Server listening on {PORT}")
 
-    while True:
-        conn, addr = s.accept()
-        t = threading.Thread(target=handle_client, args=(conn, addr))
-        t.daemon = True
-        t.start()
+            while True:
+                conn, addr = s.accept()
+                t = threading.Thread(target=handle_client, args=(conn, addr))
+                t.daemon = True
+                t.start()
 
-if __name__ == '__main__':
-    start_server()
-```
+        if __name__ == '__main__':
+            start_server()
+        ```
 
 4.  **运行客户端:**
     *   **不要** 加载 `giantvm-kvm.ko`。
@@ -572,3 +571,120 @@ if __name__ == '__main__':
 **总结：**
 *   **原版全共享模式：** 支持 CPU/Mem 分布式，但 GPU 无法使用，速度极慢。
 *   **只共享内存模式：** 放弃 CPU 分布式，换取 GPU 直通和原生 CPU 速度。**这是唯一能玩游戏的方案。**
+
+### 第五部分：原版模式运行 Star Citizen
+
+为了让《星际公民》（Star Citizen，一款对 I/O 和内存吞吐极其敏感的游戏）在 GiantVM 原版模式下达到**“可玩（Playable）”**的极限（比如 15-30 FPS，操作延迟 < 100ms），你必须进行一场**“全链路极致压榨”**的配置。
+
+以下是针对你这个特殊环境的**终极优化方案**：
+
+---
+
+#### 第一层：物理层与网络层（RDMA 调优）
+*目标：把物理延迟压到物理极限，让 DSM 协议跑在光速上。*
+
+1.  **硬件要求：**
+    *   必须使用支持 **RoCE v2** 或 **InfiniBand** 的网卡（ConnectX-4 或更高）。
+    *   交换机必须配置 **PFC (Priority Flow Control)** 和 **ECN**，保证 RDMA 流量无丢包（无损网络）。GiantVM 的 DSM 协议极其脆弱，一旦丢包导致 TCP 重传（或者 RDMA 重传），游戏会瞬间卡死 200ms 以上。
+2.  **MTU 巨帧：**
+    *   所有节点（L0 和 L1）的 MTU 必须设为 **9000**（甚至更高，如果 IB 支持）。减少包头开销，提高有效载荷。
+3.  **CPU 绑核 (Pinning)：**
+    *   **极其重要。** RDMA Polling 线程必须独占物理核心。
+    *   在 L0 宿主机上，将 L1 虚拟机的 vCPU 与物理核心 **1:1 绑定**。
+    *   防止宿主机调度器把处理 DSM 的线程切走，哪怕切走 1ms，对游戏来说就是掉帧。
+
+---
+
+#### 第二层：L1 宿主机层（GPU 供给侧）
+*目标：让 GPU 渲染完直接推流，绝对不要写回虚拟机！*
+
+这是**最核心**的策略变更。千万不要让 VirtualGL 把渲染好的画面通过网络传回 GiantVM 的 Windows 桌面显示。
+**因为：渲染回写 = 巨量内存写入 = 巨量 DSM 同步 = 崩溃。**
+
+**正确做法：** 采用“**计算与显示分离**”架构。
+
+1.  **L1 节点配置 (GPU Server)：**
+    *   配置好 **VirtualGL** 服务端。
+    *   配置 **TurboVNC** 或 **Sunshine** (推荐)。
+    *   **关键操作：** 在 L1 节点上直接启动一个 X Server（带 GPU 加速），用来承载 GiantVM 发来的渲染指令。
+
+2.  **显示输出路径（旁路推流）：**
+    *   **不要**在 GiantVM (L2) 里面看画面。
+    *   你需要在 **L1 节点** 上运行推流服务（Sunshine/Moonlight Host）。
+    *   **数据流向：**
+        1.  GiantVM (CPU) 发出 OpenGL/Vulkan 指令 ->
+        2.  VirtualGL 拦截 ->
+        3.  发给 L1 节点的 GPU 渲染 ->
+        4.  **渲染结果直接存入 L1 的显存/内存** ->
+        5.  Sunshine (运行在 L1) 直接捕获 L1 的屏幕/显存 ->
+        6.  编码视频流 ->
+        7.  通过普通 TCP/UDP 发送到你手里的物理显示终端（手机/PC）。
+
+    *   **结果：** 这一路下来，**没有一帧画面数据经过 GiantVM 的 DSM 协议**。GiantVM 只负责处理鼠标输入和游戏逻辑（物理碰撞、AI），负载降低 90%。
+
+---
+
+#### 第三层：GiantVM L2 内部（Windows 减肥）
+*目标：消灭一切不必要的内存写入。*
+
+Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式阉割：
+
+1.  **系统版本：**
+    *   务必使用 **Windows 10 LTSC** 或 **Tiny10**（魔改精简版）。不要用普通的 Home/Pro 版。
+2.  **服务禁用（必须）：**
+    *   `Windows Defender` (实时扫描会疯狂读写内存，必关)。
+    *   `SysMain` (原 Superfetch，会预加载内存，导致不必要的 DSM 流量)。
+    *   `Windows Search` (索引文件，卡顿源)。
+    *   `Windows Update`。
+3.  **内存机制：**
+    *   **关闭虚拟内存 (Pagefile):** 彻底关闭。强迫 Windows 只用 RAM。因为如果发生 Swap，就是“在网络内存上的虚拟磁盘上进行换页”，速度会慢到系统静止。
+4.  **网络驱动 (Virtio)：**
+    *   使用最新的 NetKVM 驱动，并开启多队列 (Multiqueue)。
+
+---
+
+#### 第四层：游戏配置（星际公民特调）
+*目标：减少 I/O 请求。*
+
+1.  **游戏安装位置：**
+    *   **绝对不能**放在基于 QCOW2 的虚拟磁盘上。
+    *   **方案 A (土豪)：** 给 GiantVM 分配 128GB 内存，创建一个 **Ramdisk**，把《星际公民》拷进去运行。这是最快的，I/O 速度等于内存速度。
+    *   **方案 B (常规)：** 在 L1 宿主机上挂载 NVMe SSD，通过 `virtio-scsi` (配置 `iothread`) 透传给 GiantVM。
+2.  **r_DisplayInfo = 3：**
+    *   进游戏第一时间开启性能监视，关注 CPU 延迟。
+3.  **降低物理计算频率：**
+    *   如果可能，降低游戏的分辨率和物理效果。虽然 GPU 在 L1 跑得飞快，但 CPU (跑在 GiantVM 里) 需要处理物理碰撞数据。如果 CPU 算不过来，GPU 渲染再快也没用。
+
+---
+
+#### 最终架构图（Playable Configuration）
+
+```text
+【你的物理机/客户端】(运行 Moonlight Client)
+       ^
+       | (h.264/h.265 视频流，绕过 GiantVM)
+       |
+【L1 宿主机 (Node 1)】 <---(RDMA 极速同步)---> 【L1 宿主机 (Node 0)】
+   |  [NVIDIA 4090]                                  |
+   |  (运行 X Server + VirtualGL Server)             |
+   |  (运行 Sunshine 推流服务)                        |
+   |                                                 |
+   +-------------------------------------------------+
+           | (VirtualGL 传输渲染指令)
+           v
+   【GiantVM L2 (Windows 10)】
+      - 运行 Star Citizen.exe (CPU 逻辑)
+      - 拦截 GPU 调用 -> 发送给 L1
+      - 内存：分布在 Node0/1 上 (RDMA 加速)
+      - 磁盘：Ramdisk (避免 I/O)
+```
+
+#### 预期效果评估
+
+*   **帧率 (FPS):** 如果 L1 的显卡够强，且使用了上述“旁路推流”方案，画面本身可以达到 **30-60 FPS**。
+*   **操作延迟:** 约 **50-80ms**（Sunshine 编码延迟 + 网络传输）。
+*   **卡顿 (Stuttering):** 依然会存在。每当游戏加载新资产（进入新区域、刷出新飞船）时，CPU 需要分配新内存，这会触发 DSM 锁，导致瞬间掉帧。
+*   **结论:** 这是一个**“可以起飞，可以看风景，但打空战可能会输”**的状态。
+
+**一句话总结配置核心：**
+**用 RDMA 救 CPU 和内存，用 Sunshine+VirtualGL 旁路推流救显卡，用 Ramdisk 救硬盘。** 祝你好运，公民！
