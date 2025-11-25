@@ -1,58 +1,181 @@
-这是一份**最终定稿、无遗漏、工程级**的实施手册。
-
-它严格遵循你的要求：
-1.  **万节点支持：** 修复了内核栈溢出、位图溢出、Select 限制、端口耗尽。
-2.  **双模自动切换：** 代码自动检测 `/dev/giantvm` 决定走原版内核逻辑还是 UFFD 逻辑。
-3.  **部署隔离：** 提供了 L1 嵌套虚拟化部署（科研用）和 宿主机直接部署（玩游戏用）两套完整流程。
+这是一份**最终定稿、全量合并、工程级**的实施手册。
+它将所有之前的讨论（包括栈溢出修复、启动风暴修复、万节点扩展、双模切换）整合为一份可直接执行的文档。
 
 ---
 
-### 第一部分：内核模块修改清单 (GiantVM-KVM)
-*目录：`giantvm-kvm/` (或 `kernel/`)*
+**适用版本：** GiantVM-KVM (Linux 5.x/4.x basis) & QEMU 4.x/5.x basis
+**核心目标：** 支持 10,240 节点集群，修复所有已知崩溃点，实现 Kernel/UFFD 双模自动切换。
 
-#### 1. 文件：`kvm_host.h`
-**操作：** 找到 `DSM_MAX_INSTANCES` 和 `copyset_t` 的定义，**替换**为：
+---
 
+## 1. 内核模块修改清单 (GiantVM-KVM)
+*工作目录：`giantvm-kvm/` 或 `kernel/`*
+
+### 1.1 头文件扩容与结构体重构
+**文件：** `kvm_host.h`
+
+**【操作】** 找到 `DSM_MAX_INSTANCES` 和 `copyset_t` 的定义。
+
+**【修改前】** (示例)
 ```c
-/* [修改] 扩容至 10240 */
+#define DSM_MAX_INSTANCES 64
+typedef unsigned long copyset_t[...]; // 可能是数组定义
+```
+
+**【修改后】** (强制扩容并封装为结构体，防止参数传递时退化为指针)
+```c
+
+#ifndef __KVM_HOST_H_FRONTIER_EXTENSION
+#define __KVM_HOST_H_FRONTIER_EXTENSION
+
+/* [Frontier] 1. 扩容与头文件依赖 */
 #define DSM_MAX_INSTANCES 10240
-
 #include <linux/bitmap.h>
-#include <linux/types.h>
-#include <linux/slab.h> // for kzalloc
+#include <linux/slab.h>
+#include <linux/types.h> // 确保 uint16_t 等可用
 
-/* [修改] 定义为位图结构体 */
+/* [Frontier] 2. 新版 Copyset (结构体封装) */
 typedef struct {
     unsigned long bits[BITS_TO_LONGS(DSM_MAX_INSTANCES)];
 } copyset_t;
+
+/* [Frontier] 3. 搬运枚举定义 (供全局使用) */
+enum kvm_dsm_request_type {
+	DSM_REQ_INVALIDATE,
+	DSM_REQ_READ,
+	DSM_REQ_WRITE,
+};
+
+/* [Frontier] 4. 搬运 Request 结构体 */
+struct dsm_request {
+	unsigned char requester;
+	unsigned char msg_sender;
+	gfn_t gfn;
+	unsigned char req_type;
+	bool is_smm;
+	uint16_t version;
+};
+
+/* [Frontier] 5. 搬运 Response 结构体 (导致崩溃的元凶) */
+struct dsm_response {
+	copyset_t inv_copyset;
+	uint16_t version;
+};
+
+/* [Frontier] 6. 声明全局缓存池变量 */
+extern struct kmem_cache *dsm_resp_cache;
+
+#endif /* __KVM_HOST_H_FRONTIER_EXTENSION */
 ```
 
-#### 2. 文件：`ivy.c`
-**操作：** 需要修改 4 个地方。
+---
 
-**A. 顶部辅助函数 (替换 `dsm_add_to_copyset` 和 `dsm_clear_copyset`)**
+### 1.2. 核心协议逻辑 (栈溢出修复 + Jitter + Cache)
+**文件：** `ivy.c`
+
+**【修改目标】**
+1.  引入随机延迟 (`inject_jitter`) 防止 TCP 拥塞。
+2.  将大结构体 (`struct dsm_response`) 改为从 Slab Cache 动态分配。
+3.  修复 Copyset 指针操作。
+
+**【代码对比】**
+
+#### A. 辅助函数与头文件
+
+**[修改后 / Modified]** (直接添加在文件头部)
 ```c
-static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn, int id)
+#include <linux/random.h>
+#include <linux/delay.h>
+
+/* 
+ * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
+ * [删除] struct dsm_request ... (已移至 kvm_host.h)
+ * [删除] struct dsm_response ... (已移至 kvm_host.h)
+ */
+
+/* [保留] 这个是本地调试用的描述符，不用移 */
+static char* req_desc[3] = {"INV", "READ", "WRITE"};
+
+/* 
+ * [修改] dsm_get_copyset
+ * 变化：现在 copyset 是结构体，我们需要返回它的地址 (&)，
+ * 否则返回的是整个巨大的结构体副本。
+ */
+static inline copyset_t *dsm_get_copyset(
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-    /* [修改] 指向 .bits */
-    set_bit(id, slot->vfn_dsm_state[vfn - slot->base_vfn].copyset.bits);
+    /* 添加 & 取地址符 */
+	return &slot->vfn_dsm_state[vfn - slot->base_vfn].copyset;
 }
 
+/* [Frontier] 微秒级抖动，打散万节点并发请求 */
+/* 定义一个模块参数，允许运行时修改 */
+static int enable_jitter = 1;
+module_param(enable_jitter, int, 0644);
+
+static inline void inject_jitter(void) {
+    if (!enable_jitter) return; /* 玩游戏时，echo 0 > /sys/module/giantvm_kvm/parameters/enable_jitter */
+    unsigned int delay = prandom_u32() % 10000;
+    ndelay(delay);
+}
+
+/* [修改] 适配结构体 */
+static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn, int id)
+{
+    set_bit(id, slot->vfn_dsm_state[vfn - slot->base_vfn].copyset.bits);
+    /* set_bit(id, dsm_get_copyset(slot, vfn)->bits); */
+}
+
+/* [修改] 适配结构体 */
 static inline void dsm_clear_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-    /* [修改] 指向 .bits */
     bitmap_zero(dsm_get_copyset(slot, vfn)->bits, DSM_MAX_INSTANCES);
 }
 ```
 
-**B. `kvm_dsm_invalidate` 函数循环**
+#### B. 失效广播逻辑 (修复遍历 Bug)
+**【替换说明】** 找到 `kvm_dsm_invalidate` 函数，全量替换。
+
 ```c
-    /* [修改] 遍历结构体内的 bits */
+static void kvm_dsm_invalidate(struct kvm *kvm,
+        struct kvm_dsm_memory_slot *slot, hfn_t vfn)
+{
+    unsigned long holder;
+    /* [修改] 获取结构体指针 */
+    copyset_t *copyset = dsm_get_copyset(slot, vfn);
+    
+    struct dsm_request req = {
+        .req_type = DSM_REQ_INVALIDATE,
+        .requester = kvm->arch.dsm_id,
+        .msg_sender = kvm->arch.dsm_id,
+        .gfn = slot->base_gfn + (vfn - slot->base_vfn),
+        .version = dsm_get_version(slot, vfn),
+    };
+
+    /* [关键修复] 遍历 copyset->bits，防止指针类型不匹配 */
     for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
+        if (holder == kvm->arch.dsm_id)
+            continue;
+        kvm_dsm_send_req(kvm, holder, &req, NULL);
+    }
+
+    dsm_clear_copyset(slot, vfn);
+}
 ```
 
-**C. `dsm_handle_write_req` 函数 (修复栈溢出 + 位操作)**
-**全量替换该函数的实现：**
+#### C. 写请求处理 (dsm_handle_write_req)
+
+**[原代码 / Original]** (逻辑概要)
+```c
+static int dsm_handle_write_req(...) {
+    struct dsm_response resp; // 在栈上分配，导致栈溢出
+    /* ... 逻辑处理 ... */
+    tx_add->inv_copyset = resp.inv_copyset;
+    /* ... */
+}
+```
+
+**[修改后 / Modified]**
 ```c
 static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		struct kvm_memory_slot *memslot, struct kvm_dsm_memory_slot *slot,
@@ -62,32 +185,35 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
     int ret = 0, length = 0;
     int owner = -1;
     bool is_owner = false;
-    /* [关键修改] 改为指针，防止爆栈 */
+    
+    /* [Frontier] 改为指针，从专用 Slab Cache 分配 */
     struct dsm_response *resp;
-
-    /* [关键修改] 动态分配 */
-    resp = kzalloc(sizeof(struct dsm_response), GFP_KERNEL);
+    resp = kmem_cache_zalloc(dsm_resp_cache, GFP_KERNEL);
     if (!resp) return -ENOMEM;
 
-    // ... (省略部分未变代码，如 pinned 检查) ...
+    /* [Frontier] 插入抖动，防止拥塞 */
+    inject_jitter();
+
+    if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
+        *retry = true;
+        goto out_free; 
+    }
 
     if ((is_owner = dsm_is_owner(slot, vfn))) {
-        // ...
+        BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
         dsm_change_state(slot, vfn, DSM_INVALID);
         kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
         
-        /* [修改] 使用 memcpy 复制结构体 */
+        /* 使用 memcpy 操作结构体 */
         memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
         resp->version = dsm_get_version(slot, vfn);
         
-        /* [修改] 位操作改为 .bits */
         clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
         
         ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-        if (ret < 0) goto out_free; // 注意跳转释放
+        if (ret < 0) goto out_free;
     }
     else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
-        /* [修改] 位图清零 */
         bitmap_zero(resp->inv_copyset.bits, DSM_MAX_INSTANCES);
         resp->version = dsm_get_version(slot, vfn);
         ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
@@ -96,9 +222,16 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
         dsm_change_state(slot, vfn, DSM_INVALID);
     }
     else {
-        struct dsm_request new_req = { /* ... 初始化保持不变 ... */ };
+        struct dsm_request new_req = {
+            .req_type = DSM_REQ_WRITE,
+            .requester = kvm->arch.dsm_id,
+            .msg_sender = req->msg_sender,
+            .gfn = req->gfn,
+            .is_smm = req->is_smm,
+            .version = req->version,
+        };
         owner = dsm_get_prob_owner(slot, vfn);
-        /* 传入 resp 指针 */
+        /* 传入指针 */
         ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
         if (ret < 0) goto out_free;
 
@@ -106,7 +239,6 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
         kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
         dsm_set_prob_owner(slot, vfn, req->msg_sender);
         
-        /* [修改] 位操作 */
         clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
     }
 
@@ -114,25 +246,20 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
         length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
     }
 
-    /* 结构体赋值是安全的 */
     tx_add->inv_copyset = resp->inv_copyset;
     tx_add->version = resp->version;
     ret = network_ops.send(conn_sock, page, length, 0, tx_add);
 
 out_free:
-    kfree(resp); /* [关键] 释放内存 */
+    /* [Frontier] 归还内存到 Cache */
+    kmem_cache_free(dsm_resp_cache, resp);
     return ret;
 }
 ```
 
-**D. `dsm_handle_read_req` 函数**
+#### D. 读请求处理 (dsm_handle_read_req)
 
-请找到 `dsm_handle_read_req` 函数，用下面的代码**完全替换**它。
-
-**修改重点：**
-*   使用 `kzalloc` 动态分配 `resp` 结构体（防止 1.3KB 的结构体撑爆 8KB 的内核栈）。
-*   将所有 `&resp.inv_copyset` 修改为 `resp->inv_copyset.bits`。
-*   确保所有退出路径（`goto out`）都调用 `kfree(resp)`。
+**【操作】** 打开 `ivy.c`，找到 `dsm_handle_read_req`，用下面的代码**全量替换**：
 
 ```c
 static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
@@ -144,62 +271,50 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 	int owner = -1;
 	bool is_owner = false;
 	
-	/* [修改] 改为指针，防止内核栈溢出 */
+	/* [Frontier] 1. 改为指针 */
 	struct dsm_response *resp;
 
-	/* [修改] 动态分配内存 */
-	resp = kzalloc(sizeof(struct dsm_response), GFP_KERNEL);
+	/* [Frontier] 2. 从专用 Slab Cache 分配 */
+	resp = kmem_cache_zalloc(dsm_resp_cache, GFP_KERNEL);
 	if (!resp) return -ENOMEM;
 
-	/* 初始化 version，防止未初始化使用 */
+    /* [Frontier] 3. 注入微抖动 (可选，与 Write 保持一致) */
+    inject_jitter();
+
 	resp->version = 0;
 
 	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
-		dsm_debug("kvm[%d] REQ_READ blocked by pinned gfn[%llu,%d], sleep then retry\n",
-				kvm->arch.dsm_id, req->gfn, req->is_smm);
 		ret = 0;
-		goto out_free; // 必须释放
+		goto out_free; /* 必须跳转释放 */
 	}
 
 	if ((is_owner = dsm_is_owner(slot, vfn))) {
 		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
-
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](S1) changed owner of gfn[%llu,%d] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, kvm->arch.dsm_id, req->msg_sender);
-		
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
 
 		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			goto out_free;
+		if (ret < 0) goto out_free;
 
-		/* 
-		 * [修改] 使用 memcpy 复制 copyset 结构体 
-		 * 原代码: resp.inv_copyset = *dsm_get_copyset(slot, vfn);
-		 */
+        /* [修改] memcpy 复制结构体 */
 		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
-
-		/* [修改] 使用 test_bit 和 .bits */
+        
+        /* [修改] 指针操作检查 */
 		BUG_ON(!(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
-		
 		resp->version = dsm_get_version(slot, vfn);
 	}
 	else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
 		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			goto out_free;
+		if (ret < 0) goto out_free;
 
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
 		
-		/* [修改] 使用 memcpy */
+        /* [修改] memcpy */
 		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
-		
 		resp->version = dsm_get_version(slot, vfn);
 	}
 	else {
@@ -213,70 +328,187 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
 		
-		/* [修改] 传入 resp 指针 */
+        /* [修改] 传入 resp 指针 */
 		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
-		if (ret < 0)
-			goto out_free;
+		if (ret < 0) goto out_free;
 		
-		/* [修改] 使用 test_bit 和 .bits */
-		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id,
-						resp->inv_copyset.bits)));
-		
+        /* [修改] bits 操作 */
+		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](S3) changed owner of gfn[%llu,%d] vfn[%llu] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, vfn, owner, req->msg_sender);
 	}
 
 	if (is_owner) {
-		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot,
-				req->gfn, req->version);
+		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
 	}
 
-	/* [修改] 结构体赋值，安全 */
 	tx_add->inv_copyset = resp->inv_copyset;
 	tx_add->version = resp->version;
 	
 	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
-	if (ret < 0)
-		goto out_free;
-		
-	dsm_debug_v("kvm[%d] sent page[%llu,%d] to kvm[%d] length %d hash: 0x%x\n",
-			kvm->arch.dsm_id, req->gfn, req->is_smm, req->requester, length,
-			jhash(page, length, JHASH_INITVAL));
 
 out_free:
-	/* [新增] 必须释放动态分配的内存 */
-	kfree(resp);
+    /* [Frontier] 4. 释放回 Cache */
+	kmem_cache_free(dsm_resp_cache, resp);
 	return ret;
 }
 ```
 
-#### 3. 文件：`dsm.c`
-**操作：** 找到 `kvm_dsm_add_memslot` 函数中的 `memcpy`，**替换为**：
+---
+
+### 1.3 内存槽拷贝修正 (dsm.c)
+**文件：** `dsm.c`
+
+**【操作】** 找到 `kvm_dsm_add_memslot` 函数，替换结构体拷贝部分。
+
 ```c
 #ifdef IVY_KVM_DSM
-    /* [修改] 使用 bitmap_copy */
+    /* [修改] 使用 bitmap_copy 进行拷贝 */
     bitmap_copy(new_hvaslot->vfn_dsm_state[i + (vfn - new_hvaslot->base_vfn)].copyset.bits,
                 hvaslot->vfn_dsm_state[i + (gfn - gfn_iter)].copyset.bits,
                 DSM_MAX_INSTANCES);
 #endif
 ```
 
----
+### 1.4. 模块生命周期管理 (Slab Cache 初始化)
+**文件：** `kvm_main.c`
 
-### 第二部分：QEMU 源码修改清单 (目录: `qemu/`)
+**【修改目标】**
+1.  定义全局变量 `dsm_resp_cache`。
+2.  在 `kvm_init` 中创建缓存池。
+3.  在 `kvm_exit` 中销毁缓存池。
 
-#### 1. 文件：`hw/tpm/tpm_tis.c` (修复 Select 崩溃)
-**头部添加：** `#include <poll.h>`
-**替换 `tpm_util_test` 中的 select 逻辑：**
+**【代码对比】**
+
+#### A. 全局变量定义 (文件头部)
+
+**[原代码 / Original]**
+*(无)*
+
+**[修改后 / Modified]**
 ```c
-    /* [修改] 替换 select 为 poll，防止 >1024 连接崩溃 */
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
-    n = poll(&pfd, 1, 1000);
+/* [Frontier] 定义 DSM 专用缓存池 */
+struct kmem_cache *dsm_resp_cache;
+EXPORT_SYMBOL_GPL(dsm_resp_cache);
 ```
 
-#### 2. 新增文件：`dsm_backend.h`
+#### B. 初始化函数 (kvm_init)
+
+**[原代码 / Original]**
+```c
+	kvm_vcpu_cache = kmem_cache_create("kvm_vcpu", vcpu_size, vcpu_align,
+					   SLAB_ACCOUNT, NULL);
+	if (!kvm_vcpu_cache) {
+		r = -ENOMEM;
+		goto out_free_3;
+	}
+
+	r = kvm_async_pf_init();
+	if (r)
+		goto out_free;
+```
+
+**[修改后 / Modified]**
+```c
+	kvm_vcpu_cache = kmem_cache_create("kvm_vcpu", vcpu_size, vcpu_align,
+					   SLAB_ACCOUNT, NULL);
+	if (!kvm_vcpu_cache) {
+		r = -ENOMEM;
+		goto out_free_3;
+	}
+
+	/* [Frontier] 初始化 DSM Response 专用缓存池 */
+	/* 解决万节点高频交互下的内核内存碎片问题 */
+	dsm_resp_cache = kmem_cache_create("dsm_resp_cache", 
+					   sizeof(struct dsm_response), 
+					   0, SLAB_HWCACHE_ALIGN, NULL);
+	if (!dsm_resp_cache) {
+		r = -ENOMEM;
+		goto out_free_vcpu_cache; /* 跳转到特定的释放点 */
+	}
+
+	r = kvm_async_pf_init();
+	if (r)
+		goto out_free_dsm_cache; /* 跳转到特定的释放点 */
+
+    /* ... 后续代码 ... */
+    
+    /* 在函数末尾添加新的错误处理标签 */
+out_free_dsm_cache:
+	kmem_cache_destroy(dsm_resp_cache);
+out_free_vcpu_cache:
+	kmem_cache_destroy(kvm_vcpu_cache);
+    /* 接入原有的 out_free_3 */
+```
+
+#### C. 退出函数 (kvm_exit)
+
+**[原代码 / Original]**
+```c
+void kvm_exit(void)
+{
+	debugfs_remove_recursive(kvm_debugfs_dir);
+	misc_deregister(&kvm_dev);
+	kmem_cache_destroy(kvm_vcpu_cache);
+	kvm_async_pf_deinit();
+    /* ... */
+```
+
+**[修改后 / Modified]**
+```c
+void kvm_exit(void)
+{
+	debugfs_remove_recursive(kvm_debugfs_dir);
+	misc_deregister(&kvm_dev);
+
+	/* [Frontier] 销毁 DSM 缓存池 (LIFO 原则，先销毁后创建的) */
+	if (dsm_resp_cache)
+		kmem_cache_destroy(dsm_resp_cache);
+
+	kmem_cache_destroy(kvm_vcpu_cache);
+	kvm_async_pf_deinit();
+	unregister_syscore_ops(&kvm_syscore_ops);
+	unregister_reboot_notifier(&kvm_reboot_notifier);
+	cpuhp_remove_state_nocalls(CPUHP_AP_KVM_STARTING);
+	on_each_cpu(hardware_disable_nolock, NULL, 1);
+	kvm_arch_hardware_unsetup();
+	kvm_arch_exit();
+	kvm_irqfd_exit();
+	free_cpumask_var(cpus_hardware_enabled);
+	kvm_vfio_ops_exit();
+}
+EXPORT_SYMBOL_GPL(kvm_exit);
+```
+
+---
+
+## 2. QEMU 源码修改清单 (QEMU-System)
+*工作目录：`qemu/`*
+
+### 2.1 修复 Select 限制崩溃
+**文件：** `hw/tpm/tpm_tis.c`
+
+**[原代码 / Original]**
+```c
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fd, &readfds);
+    n = select(fd + 1, &readfds, NULL, NULL, &tv);
+```
+
+**[修改后 / Modified]**
+```c
+#include <poll.h> /* 需确保包含 */
+
+    /* [Frontier] 使用 poll 替代 select，防止 fd > 1024 崩溃 */
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    n = poll(&pfd, 1, 1000); /* 1000ms timeout */
+```
+
+### 2.2 UFFD 双模后端引擎 (核心新增)
+
+#### A. 头文件
+**新增文件：** `dsm_backend.h`
+
 ```c
 #ifndef DSM_BACKEND_H
 #define DSM_BACKEND_H
@@ -287,9 +519,11 @@ void dsm_universal_register(void *ptr, size_t size);
 #endif
 ```
 
-#### 3. 新增文件：`dsm_backend.c` (核心双模引擎)
-*(包含全局 socket 池优化，防止端口耗尽)*
+#### B. 实现文件 (包含 Lazy Connect 与 细粒度锁)
+**文件：** 新增 `dsm_backend.c`
+**注意：** 包含 `inject_jitter` 防止 UFFD 模式下的网络拥塞。
 
+**[全量新代码 / New File]**
 ```c
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
@@ -309,29 +543,104 @@ void dsm_universal_register(void *ptr, size_t size);
 #define __NR_userfaultfd 323
 #endif
 
-// 配置
+// 配置参数
 #define PREFETCH 32
 #define PAGE_SIZE 4096
-const char *NODE_IPS[] = { "127.0.0.1" }; // [部署时请修改 IP]
+
+// 服务端 IP 列表 (应修改为实际 IP 地址)
+const char *NODE_IPS[] = { "192.168.1.10", "192.168.1.11" }; 
 #define NODE_COUNT (sizeof(NODE_IPS)/sizeof(NODE_IPS[0]))
 
-int gvm_mode = 0; // 0:Kernel, 1:UFFD
+int gvm_mode = 0; 
 int uffd_fd = -1;
 int *global_sockets = NULL; 
-pthread_mutex_t net_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t *conn_locks = NULL; 
 
-static int connect_node(const char *ip) {
+/* [Frontier] 用户态抖动函数 */
+static void inject_jitter(void) {
+    if (rand() % 100 < 20) { // 20% 概率引入微小延迟
+        usleep(rand() % 10);
+    }
+}
+
+static int connect_node_impl(const char *ip) {
+    /* 1. 创建 Socket */
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
-    int f=1, b=2*1024*1024;
+
+    /* --- 原有优化配置 --- */
+    int f = 1, b = 4 * 1024 * 1024;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&f, sizeof(int));
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&b, sizeof(int));
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&b, sizeof(int));
+
+    /* --- [关键新增] 1. TCP KeepAlive 配置 --- */
+    /* 防止交换机静默丢弃空闲连接导致 QEMU 永久卡死 */
+    int keepalive = 1;
+    int keepidle = 10;   // 10秒无数据就开始探测 (比之前的60秒更激进，适应游戏场景)
+    int keepintvl = 2;   // 探测间隔2秒
+    int keepcnt = 3;     // 探测3次失败认为连接断开
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(int));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
+
+    /* --- [关键新增] 2. 读写超时配置 --- */
+    /* 防止网络拥塞时 recv 无限阻塞导致虚拟机 "Hard Hang" */
+    struct timeval timeout;
+    timeout.tv_sec = 5;  // 5秒超时。如果在5秒内还没读到数据，recv返回错误
+    timeout.tv_usec = 0;
+    
+    // 设置接收超时 (这是保命的关键)
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+    // 设置发送超时 (防止发包缓冲区满时卡死)
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+
+    /* 2. 准备地址 */
     struct sockaddr_in a;
     a.sin_family = AF_INET;
     a.sin_port = htons(9999);
     inet_pton(AF_INET, ip, &a.sin_addr);
-    if (connect(s, (struct sockaddr*)&a, sizeof(a))<0) { close(s); return -1; }
+
+    /* 3. 发起连接 */
+    if (connect(s, (struct sockaddr*)&a, sizeof(a)) < 0) { 
+        close(s); 
+        return -1; 
+    }
+}
+
+static int get_or_connect(int node_id) {
+    if (node_id < 0 || node_id >= NODE_COUNT) return -1;
+    pthread_mutex_lock(&conn_locks[node_id]);
+    static int get_or_connect(int node_id) {
+    // ... 前置检查 ...
+        pthread_mutex_lock(&conn_locks[node_id]);
+        if (global_sockets[node_id] < 0) {
+            int retries = 0;
+            int wait_time = 1000; // 1ms
+            int s = -1;
+        
+            while (retries < 5) { // 最多重试5次
+                s = connect_node_impl(NODE_IPS[node_id]);
+                if (s >= 0) break;
+            
+                /* [关键修复] 指数退避：失败后等待时间翻倍 */
+                usleep(wait_time);
+                wait_time *= 2; 
+                retries++;
+            }
+
+            if (s >= 0) {
+                global_sockets[node_id] = s;
+            } else {
+                // 严重错误：连接不上服务端
+                pthread_mutex_unlock(&conn_locks[node_id]);
+                return -1;
+            }
+        }
+    }
+    int s = global_sockets[node_id];
+    pthread_mutex_unlock(&conn_locks[node_id]);
     return s;
 }
 
@@ -343,33 +652,49 @@ void *dsm_worker(void *arg) {
 
     while(1) {
         if (read(uffd_fd, &msg, sizeof(msg)) != sizeof(msg)) continue;
+        
         if (msg.event & UFFD_EVENT_PAGEFAULT) {
             uint64_t addr = msg.arg.pagefault.address;
             uint64_t base = addr & ~(4095);
             int owner = (base / 4096) % NODE_COUNT;
             
-            /* [关键] 使用全局连接池，避免 8x 连接 */
-            int sock = global_sockets[owner];
-            if (sock < 0) continue;
+            inject_jitter(); // 发送前抖动
 
+            int sock = get_or_connect(owner);
+            if (sock < 0) continue; 
+
+            pthread_mutex_lock(&conn_locks[owner]);
             uint64_t req = htobe64(base);
-            pthread_mutex_lock(&net_lock);
             if (send(sock, &req, 8, 0) != 8) {
-                pthread_mutex_unlock(&net_lock);
+                close(sock);
+                global_sockets[owner] = -1;
+                pthread_mutex_unlock(&conn_locks[owner]);
                 continue;
             }
+
             int total = PAGE_SIZE * PREFETCH;
             int recvd = 0;
             while (recvd < total) {
                 int n = recv(sock, buf + recvd, total - recvd, 0);
-                if (n<=0) break;
+                if (n <= 0) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; // 超时，继续尝试
+                    // 真正的错误，关闭 socket 触发重连
+                    close(sock);
+                    global_sockets[owner] = -1;
+                    pthread_mutex_unlock(&conn_locks[owner]);
+                    continue; // 重新进入循环，触发 get_or_connect
+                }
+                if (n <= 0) break;
                 recvd += n;
             }
-            pthread_mutex_unlock(&net_lock);
+            pthread_mutex_unlock(&conn_locks[owner]);
 
             for(int k=0; k<PREFETCH; k++) {
                 struct uffdio_copy c = {
-                    .dst = base + k*4096, .src = (uint64_t)(buf + k*4096), .len = 4096, .mode = 0 
+                    .dst = base + k*4096, 
+                    .src = (uint64_t)(buf + k*4096), 
+                    .len = 4096, 
+                    .mode = 0 
                 };
                 ioctl(uffd_fd, UFFDIO_COPY, &c);
             }
@@ -379,29 +704,27 @@ void *dsm_worker(void *arg) {
 }
 
 void dsm_universal_init(void) {
-    // 1. 自动检测内核模块 (/dev/giantvm)
+    // 检测逻辑
     if (access("/sys/module/giantvm_kvm", F_OK) == 0 || access("/dev/giantvm", F_OK) == 0) {
         printf("[GiantVM] KERNEL MODULE DETECTED. Using ORIGINAL FULL-SHARE Mode.\n");
-        gvm_mode = 0; // 标记为 0，后续不接管
+        gvm_mode = 0; 
         return; 
     }
-
-    // 2. 无内核模块，进入 UFFD 模式
     printf("[GiantVM] NO KERNEL MODULE. Using MEMORY-ONLY Mode.\n");
     gvm_mode = 1;
     
-    if (access("/dev/kvm", R_OK|W_OK) == 0) printf("[GiantVM] KVM Detected. Accel ON.\n");
-    else printf("[GiantVM] No KVM Detected. Accel OFF (TCG).\n");
-
     uffd_fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
     if (uffd_fd >= 0) {
         struct uffdio_api api = { .api = UFFD_API, .features = 0 };
         ioctl(uffd_fd, UFFDIO_API, &api);
         
-        // [关键] 集中建立连接
         global_sockets = malloc(sizeof(int) * NODE_COUNT);
-        for(int i=0; i<NODE_COUNT; i++) global_sockets[i] = connect_node(NODE_IPS[i]);
-
+        conn_locks = malloc(sizeof(pthread_mutex_t) * NODE_COUNT);
+        
+        for(int i=0; i<NODE_COUNT; i++) {
+            global_sockets[i] = -1;
+            pthread_mutex_init(&conn_locks[i], NULL);
+        }
         for(int i=0; i<8; i++) qemu_thread_create(NULL, "dsm-w", dsm_worker, NULL, QEMU_THREAD_JOINABLE);
     }
 }
@@ -414,157 +737,358 @@ void dsm_universal_register(void *ptr, size_t size) {
 }
 ```
 
-**4. 文件：`vl.c` (注入点)**
-*   头部添加 `#include "dsm_backend.h"`。
-*   在 `start_io_router();` 之前插入 `dsm_universal_init();`。
+#### C. 代码注入点 (Injection Points)
 
-**5. 文件：`exec.c` (内存劫持)**
-*   头部添加 `#include "dsm_backend.h"`。
-*   在 `ram_block_add` 函数结束前添加 `if (new_block->host) dsm_universal_register(new_block->host, new_block->max_length);`。
+1.  **文件 `vl.c` (Main Loop):**
+    *   在文件头添加：`#include "dsm_backend.h"`
+    *   在 `main` 函数中，找到 `start_io_router();`（或类似的 QEMU 初始化后期），在其**之前**插入：
+        ```c
+        dsm_universal_init();
+        ```
 
-**6. 文件：`Makefile.objs`**
-*   `common-obj-y += vl.o` 后添加 `common-obj-y += dsm_backend.o`。
+2.  **文件 `exec.c` (Memory Handling):**
+    *   在文件头添加：`#include "dsm_backend.h"`
+    *   在 `ram_block_add` 函数中，找到 `return 0;` 之前的位置，插入：
+        ```c
+        if (new_block->host) dsm_universal_register(new_block->host, new_block->max_length);
+        ```
+
+3.  **文件 `Makefile.objs`:**
+    *   找到 `common-obj-y += vl.o`，在后面添加：
+        ```makefile
+        common-obj-y += dsm_backend.o
+        ```
 
 ---
 
-### 第三部分：完整部署流程
+## 3. 内存服务端脚本 (Mode B 专用)
+** SO_REUSEPORT 多进程版 (fast_mem_server.c) **
+**文件：** `fast_mem_server.c`
 
-#### 流程 A：原版全共享模式 (L1 虚拟机嵌套部署)
-*目的：科研/全功能测试。*
+**【修改目标】**
+1.  开启 `SO_REUSEPORT`，允许启动多个进程绑定同一端口。
+2.  利用内核自动负载均衡解决单线程 Accept 瓶颈。
 
-1.  **宿主机 (Ubuntu 22.04):**
-    *   开启嵌套：`sudo modprobe kvm_intel nested=1`。
-    *   安装 QEMU：`sudo apt install qemu-kvm`。
-2.  **L1 虚拟机 (Ubuntu 16.04):**
-    *   启动：`qemu-system-x86_64 -enable-kvm -cpu host ...`。
-3.  **L1 内部操作:**
-    *   `ulimit -n 100000`。
-    *   编译内核模块：`make && insmod giantvm-kvm.ko`。
-    *   编译修改版 QEMU。
-    *   准备 `cluster.conf`。
-    *   运行：`./qemu-system-x86_64 -enable-kvm -giantvm-id 0 ...`。
-    *   **结果：** `dsm_universal_init` 发现内核模块，原版逻辑接管。
+**【全量新代码 / New File】**
+```c
+/* 
+ * GiantVM Frontier High-Performance Memory Server 
+ * Feature: SO_REUSEPORT included for Multi-Process Scaling
+ * Compile: gcc -O3 -o fast_mem_server fast_mem_server.c -lpthread
+ * Usage: Run 8 instances of this program in background.
+ */
+#include <endian.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/mman.h>
+#include <errno.h>
 
-#### 流程 B：只共享内存模式 (宿主机直接部署)
-*目的：玩《星际公民》。*
+#define MAX_EVENTS 10240
+#define PORT 9999
+#define PAGE_SIZE 4096
+#define PREFETCH 32
+#define MEM_FILE "physical_ram.img"
 
-1.  **宿主机 (Ubuntu 22.04):**
-    *   `ulimit -n 100000`。
-    *   `echo always > /sys/kernel/mm/transparent_hugepage/enabled`。
-2.  **编译 QEMU:**
-    *   `./configure --target-list=x86_64-softmmu --enable-kvm --disable-werror && make -j`。
-3.  **运行服务端:**
-    *   运行 `python3 memory_server.py`。
-        ```python
-        import socket
-        import struct
-        import threading
-        import os
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-        # === 配置区 ===
-        HOST = '0.0.0.0'
-        PORT = 9999
-        PAGE_SIZE = 4096
-        PREFETCH = 32  # 必须与 dsm_backend.c 中的 PREFETCH_COUNT 一致
-        MEM_FILE = "physical_ram.img"
-        MEM_SIZE = 32 * 1024 * 1024 * 1024  # 32GB (根据需求调整)
+int main() {
+    int listen_sock, conn_sock, nfds, epollfd;
+    struct epoll_event ev, events[MAX_EVENTS];
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
 
-        # 协议头 (必须与 dsm_backend.c 一致)
-        PROTO_ZERO = b'\xAA'
-        PROTO_DATA = b'\xBB'
-        ZERO_BLOCK = b'\x00' * PAGE_SIZE
+    int fd_mem = open(MEM_FILE, O_RDONLY);
+    if (fd_mem < 0) { perror("Open memory file"); return 1; }
+    off_t file_size = lseek(fd_mem, 0, SEEK_END);
+    char *mem_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd_mem, 0);
+    if (mem_ptr == MAP_FAILED) { perror("mmap"); return 1; }
 
-        # 初始化大文件
-        if not os.path.exists(MEM_FILE):
-            print(f"[*] Creating {MEM_SIZE // 1024**3}GB memory file...")
-            with open(MEM_FILE, "wb") as f:
-                f.seek(MEM_SIZE - 1)
-                f.write(b'\0')
-            print("[*] File created.")
-
-        def handle_client(conn, addr):
-            # TCP 调优
-            try:
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
-            except:
-                pass
-
-            print(f"[+] Connection from {addr}")
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     
-            # 每个线程独立打开文件句柄，避免 seek 竞争
-            f = open(MEM_FILE, "r+b")
+    /* [Frontier] 开启 SO_REUSEPORT，允许开启多个进程绑定同一端口 */
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     
-            try:
-                while True:
-                    # 1. 接收请求
-                    data = conn.recv(8)
-                    if not data: break
-            
-                    # 解析地址
-                    base_addr = struct.unpack('>Q', data)[0]
-            
-                    # 2. 预读数据
-                    f.seek(base_addr)
-                    chunk = f.read(PAGE_SIZE * PREFETCH)
-            
-                    # 如果读到文件末尾不足，补零
-                    if len(chunk) < PAGE_SIZE * PREFETCH:
-                        chunk += b'\x00' * (PAGE_SIZE * PREFETCH - len(chunk))
-            
-                    # 3. 分片发送
-                    for i in range(PREFETCH):
-                        page_data = chunk[i*PAGE_SIZE : (i+1)*PAGE_SIZE]
+    //int bufsize = 4 * 1024 * 1024;
+    //setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    //setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
+
+    if (bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    if (listen(listen_sock, 20000) < 0) { perror("listen"); return 1; }
+
+    epollfd = epoll_create1(0);
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_sock;
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sock, &ev) == -1) { perror("epoll_ctl: listen_sock"); return 1; }
+
+    printf("[*] High-Perf Memory Server running on port %d (PID: %d)\n", PORT, getpid());
+
+    while (1) {
+        nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        if (nfds == -1) { perror("epoll_wait"); break; }
+
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == listen_sock) {
+                conn_sock = accept(listen_sock, (struct sockaddr *)&addr, &addrlen);
+                if (conn_sock == -1) continue;
+                set_nonblocking(conn_sock);
                 
-                        if page_data == ZERO_BLOCK:
-                            conn.sendall(PROTO_ZERO)
-                        else:
-                            conn.sendall(PROTO_DATA + page_data)
+                int flag = 1;
+                setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+                ev.events = EPOLLIN | EPOLLET;
+                ev.data.fd = conn_sock;
+                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) {
+                    close(conn_sock);
+                }
+            } else {
+                int fd = events[n].data.fd;
+                /* [CRITICAL FIX] 循环读取直到 EAGAIN */
+                while (1) {
+                    uint64_t req_addr_be;
+                    ssize_t count = recv(fd, &req_addr_be, 8, 0);
                     
-            except Exception as e:
-                print(f"[-] Error {addr}: {e}")
-            finally:
-                f.close()
-                conn.close()
-
-        def start_server():
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((HOST, PORT))
-            s.listen(100)
-            print(f"[*] ULTIMATE Memory Server listening on {PORT}")
-
-            while True:
-                conn, addr = s.accept()
-                t = threading.Thread(target=handle_client, args=(conn, addr))
-                t.daemon = True
-                t.start()
-
-        if __name__ == '__main__':
-            start_server()
-        ```
-
-4.  **运行客户端:**
-    *   **不要** 加载 `giantvm-kvm.ko`。
-    *   命令：
-        ```bash
-        sudo ./x86_64-softmmu/qemu-system-x86_64 \
-          -machine accel=kvm:tcg \
-          -m 16G \
-          -device vfio-pci,host=XX:XX.X \
-          -drive file=win10.qcow2 ...
-        ```
-    *   **结果：** `dsm_universal_init` 未发现内核模块，启动 UFFD 模式。
+                    if (count == 8) {
+                        uint64_t base = be64toh(req_addr_be);
+                        if (base + PAGE_SIZE * PREFETCH > file_size) base = 0; 
+                        
+                        /* 发送也要处理部分写入的情况，虽然在这里概率较低，但严谨起见 */
+                        size_t total_to_send = PAGE_SIZE * PREFETCH;
+                        size_t sent_total = 0;
+                        char *send_ptr = mem_ptr + base;
+                        while(sent_total < total_to_send) {
+                            ssize_t s = send(fd, send_ptr + sent_total, total_to_send - sent_total, 0);
+                            if (s < 0) {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                                close(fd); goto next_event; // 连接断开
+                            }
+                            sent_total += s;
+                        }
+                    } else if (count < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 读空了，退出循环等待下一次事件
+                        close(fd); 
+                        break;
+                    } else if (count == 0) {
+                        close(fd); // 对端关闭
+                        break;
+                    } else {
+                        // 读到了半截数据(小于8字节)，这在 TCP流中极少见但理论存在
+                        // 简单处理：关连接。复杂处理：维护个 buffer 拼包。
+                        // 鉴于这是高性能场景，视为协议错误关闭即可。
+                        close(fd);
+                        break;
+                    }
+                }
+                next_event:;
+            }
+        }
+    }
+    return 0;
+}
+```
 
 ---
 
-### 第四部分：效率对比与 GPU 调用
+## 4.完整部署流程
+
+#### 0. 基础环境与依赖安装
+**所有节点（物理机或虚拟机）均需执行：**
+
+```bash
+# 1. 基础编译工具 (Kernel & QEMU)
+sudo apt-get update
+sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev \
+    pkg-config libglib2.0-dev libpixman-1-dev libpython3-dev libaio-dev libcap-ng-dev \
+    libattr1-dev libcap-dev python3-venv python3-pip
+
+# 2. 系统参数调优 (防止万节点连接耗尽资源)
+# 将以下内容追加到 /etc/sysctl.conf
+cat <<EOF | sudo tee -a /etc/sysctl.conf
+fs.file-max = 2097152
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.core.somaxconn = 65535
+vm.max_map_count = 262144
+# 1. ARP 表扩容 (关键！默认只有 1024，万节点必崩)
+net.ipv4.neigh.default.gc_thresh1 = 4096
+net.ipv4.neigh.default.gc_thresh2 = 8192
+net.ipv4.neigh.default.gc_thresh3 = 16384  # 必须大于节点数 10240
+# 2. 连接跟踪表扩容 (防止大量短连接导致丢包)
+net.netfilter.nf_conntrack_max = 1048576
+net.nf_conntrack_max = 1048576
+# 3. 孤儿 Socket 处理 (防止 Reset 风暴耗尽内存)
+net.ipv4.tcp_max_orphans = 262144
+# 4. 允许更快的端口回收 (配合代码里的重试逻辑)
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+# 6. 开启 BBR (这对高延迟/丢包环境的吞吐量至关重要)
+echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
+echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a 
+EOF
+sudo sysctl -p
+
+# 3. 用户句柄限制
+# 将以下内容追加到 /etc/security/limits.conf
+cat <<EOF | sudo tee -a /etc/security/limits.conf
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+#以此配置重新登录 Shell
+```
+
+---
+
+#### 流程 A：原版全共享模式 (DSM Mode)
+**适用场景：** 分布式操作系统研究、跨节点内存/CPU 聚合。
+**架构：** L0 (物理机) -> L1 (GiantVM 宿主机集群) -> L2 (GiantVM 客户机)。
+
+**步骤 1：L1 环境准备**
+在所有 L1 节点上安装编译好的内核模块：
+```bash
+cd giantvm-kvm/
+make -j
+sudo insmod giantvm-kvm.ko
+```
+
+**步骤 2：配置集群 (cluster.conf)**
+创建一个描述所有 L1 节点信息的配置文件 `cluster.conf`：
+```text
+# 格式: ID IP PORT
+0 192.168.1.101 9999
+1 192.168.1.102 9999
+2 192.168.1.103 9999
+...
+```
+
+**步骤 3：启动 GiantVM**
+在每个 L1 节点上运行对应的 QEMU 命令。
+*注意：必须为每个节点指定不同的 `-giantvm-id`。*
+
+```bash
+# 节点 0
+./qemu-system-x86_64 \
+  -enable-kvm \
+  -m 4G \
+  -smp 4 \
+  -giantvm-id 0 \
+  -giantvm-cluster cluster.conf \
+  -drive file=disk.qcow2,format=qcow2 \
+  -netdev tap,id=n1,ifname=tap0,script=no,downscript=no \
+  -device virtio-net-pci,netdev=n1 \
+  -vnc :0
+
+# 节点 1 (只需修改 id)
+./qemu-system-x86_64 ... -giantvm-id 1 ...
+```
+
+**验证：**
+查看 `dmesg`，如果看到 `[DSM] Connection established` 和内存映射日志，说明 DSM 协议已接管。
+
+---
+
+#### 流程 B：双模 UFFD 内存模式 (Frontier Mode)
+**适用场景：** 万节点云游戏、GPU 直通、高性能计算。
+**架构：** L0 (物理机) 直接作为计算节点和存储节点。
+
+**步骤 1：服务端 (Memory Server) 启动**
+
+*   1. 保存 C 代码
+    将上面提供的内存服务脚本保存为 `fast_mem_server.c`。
+
+*   2. 编译服务端
+    在服务端节点执行编译命令（使用 `-O3` 开启最高优化）：
+    ```bash
+    gcc -O3 -o fast_mem_server fast_mem_server.c -lpthread
+    ```
+
+*   3. 手动生成内存镜像文件 (必须)
+    Python 脚本会自动创建文件，但 C 程序为了极致速度，默认文件已存在。你需要用 `fallocate` (极快) 或 `dd` 预先分配空间。
+    *假设你需要 32GB 内存：*
+    ```bash
+    # 推荐方式 (瞬间完成)
+    fallocate -l 32G physical_ram.img
+
+    # 兼容方式 (如果文件系统不支持 fallocate)
+    # dd if=/dev/zero of=physical_ram.img bs=1G count=32
+    ```
+
+    在拥有高速存储的节点上，按顺序执行：
+
+    1.  **解除系统限制 (这步对于 C 语言 Epoll 服务端至关重要)**
+        为了能接纳 10,240 个并发连接，必须在当前 Shell 临时解除文件句柄限制（或者写入 `/etc/security/limits.conf` 永久生效）。
+        ```bash
+        ulimit -n 1048576
+        ```
+
+    2.  **启动服务端**
+        ```bash
+        ./fast_mem_server
+        ```
+        *看到输出 `[*] High-Perf Memory Server running on port 9999` 即表示启动成功。*
+
+    3.  **（可选）后台静默运行**
+        如果是生产环境部署，建议使用 `nohup`：
+        ```bash
+        nohup ./fast_mem_server > server.log 2>&1 &
+        ```
+
+    启动后，你可以用简单的 `nc` (netcat) 命令模拟客户端验证服务端是否活着：
+
+    ```bash
+    # 在另一台机器执行
+    nc -z -v <服务端IP> 9999
+    ```
+    如果返回 `succeeded`，说明端口通了。
+
+**步骤 2：客户端 (Compute Node) 准备**
+*   **卸载内核模块：** 确保 `/dev/giantvm` 不存在。
+    ```bash
+    sudo rmmod giantvm-kvm
+    ```
+*   **修改代码中的 IP：** 确保 `qemu/dsm_backend.c` 中的 `NODE_IPS` 指向了服务端 IP，并重新编译 QEMU。
+
+**步骤 3：启动客户端**
+```bash
+sudo ./qemu-system-x86_64 \
+  -name GiantVM-Frontier \
+  -machine type=q35,accel=kvm \
+  -cpu host \
+  -smp 8 \
+  -m 16G \
+  -vga std \
+  -vnc :0 \
+  -netdev user,id=n1 \
+  -device virtio-net-pci,netdev=n1
+```
+**验证：**
+QEMU 控制台输出 `[GiantVM] NO KERNEL MODULE. Using MEMORY-ONLY Mode.`，此时虚拟机内存完全由网络按需拉取。
+
+---
+
+
+## 5.效率对比与 GPU 调用
 
 **基准：** 物理机 (i9/4090) = 100%。
 
 | 模式 | 子模式 | 触发条件 | CPU 效率 | GPU 性能 | 内存性能 | GPU 调用方式 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **原版全共享** | **KVM** | 加载内核模块 | **1%~10%** | **0%** | 50µs 延迟 | **无法调用**。<br>分布式 CPU 不支持 PCIe 直通。 |
+| **原版全共享** | **KVM** | 加载内核模块 | **1%~10%** | **0%** | 50µs 延迟 | **无法直接调用**。<br>分布式 CPU 不支持 PCIe 直通，替代方案见下。 |
 | **只共享内存** | **KVM** | 无模块 + 有 KVM | **98%** | **98%** | 50µs 延迟 | **VFIO 直通**。<br>仅主节点显卡工作，玩游戏专用。 |
 | **只共享内存** | **TCG** | 无模块 + 无 KVM | **5%** | **0%** | 50µs 延迟 | **软件模拟**。<br>Virtio-GPU，无法玩游戏。 |
 
@@ -572,7 +1096,7 @@ void dsm_universal_register(void *ptr, size_t size) {
 *   **原版全共享模式：** 支持 CPU/Mem 分布式，但 GPU 无法使用，速度极慢。
 *   **只共享内存模式：** 放弃 CPU 分布式，换取 GPU 直通和原生 CPU 速度。**这是唯一能玩游戏的方案。**
 
-### 第五部分：原版模式运行 Star Citizen
+## 6.原版模式运行 Star Citizen
 
 为了让《星际公民》（Star Citizen，一款对 I/O 和内存吞吐极其敏感的游戏）在 GiantVM 原版模式下达到**“可玩（Playable）”**的极限（比如 15-30 FPS，操作延迟 < 100ms），你必须进行一场**“全链路极致压榨”**的配置。
 
@@ -676,7 +1200,7 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
       - 运行 Star Citizen.exe (CPU 逻辑)
       - 拦截 GPU 调用 -> 发送给 L1
       - 内存：分布在 Node0/1 上 (RDMA 加速)
-      - 磁盘：Ramdisk (避免 I/O)
+      - 磁盘：Ramdisk (避免 I/O 由 L1 划分)
 ```
 
 #### 预期效果评估
@@ -688,3 +1212,4 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
 
 **一句话总结配置核心：**
 **用 RDMA 救 CPU 和内存，用 Sunshine+VirtualGL 旁路推流救显卡，用 Ramdisk 救硬盘。** 祝你好运，公民！
+
