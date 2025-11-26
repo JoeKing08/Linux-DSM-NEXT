@@ -24,7 +24,6 @@ typedef unsigned long copyset_t[...]; // 可能是数组定义
 
 **【修改后】** (强制扩容并封装为结构体，防止参数传递时退化为指针)
 ```c
-
 #ifndef __KVM_HOST_H_FRONTIER_EXTENSION
 #define __KVM_HOST_H_FRONTIER_EXTENSION
 
@@ -32,40 +31,78 @@ typedef unsigned long copyset_t[...]; // 可能是数组定义
 #define DSM_MAX_INSTANCES 10240
 #include <linux/bitmap.h>
 #include <linux/slab.h>
-#include <linux/types.h> // 确保 uint16_t 等可用
+#include <linux/types.h>
 
-/* [Frontier] 2. 新版 Copyset (结构体封装) */
+/* [Frontier] 2. 新版 Copyset */
 typedef struct {
     unsigned long bits[BITS_TO_LONGS(DSM_MAX_INSTANCES)];
 } copyset_t;
 
-/* [Frontier] 3. 搬运枚举定义 (供全局使用) */
+/* [Frontier] 3. 搬运枚举定义 */
 enum kvm_dsm_request_type {
 	DSM_REQ_INVALIDATE,
 	DSM_REQ_READ,
 	DSM_REQ_WRITE,
 };
 
-/* [Frontier] 4. 搬运 Request 结构体 */
+/* 
+ * [Frontier Critical Fix] 
+ * 1. 加上 __attribute__((packed)) 防止编译器填充字节导致协议错位。
+ * 2. version 升级为 uint32_t 防止高频读写回绕。
+ */
+
+/* [Frontier] 4. 搬运并强化 Request 结构体 */
 struct dsm_request {
 	unsigned char requester;
 	unsigned char msg_sender;
 	gfn_t gfn;
 	unsigned char req_type;
 	bool is_smm;
-	uint16_t version;
-};
+	uint32_t version;     /* Fix: 从 uint16_t 升级为 uint32_t */
+} __attribute__((packed)); /* Fix: 强制对齐 */
 
-/* [Frontier] 5. 搬运 Response 结构体 (导致崩溃的元凶) */
+/* [Frontier] 5. 搬运并强化 Response 结构体 */
 struct dsm_response {
 	copyset_t inv_copyset;
-	uint16_t version;
-};
+	uint32_t version;     /* Fix: 从 uint16_t 升级为 uint32_t */
+} __attribute__((packed)); /* Fix: 强制对齐 */
 
-/* [Frontier] 6. 声明全局缓存池变量 */
+/* [Frontier] 6. 声明全局缓存池变量 (供 ivy.c 使用) */
 extern struct kmem_cache *dsm_resp_cache;
 
 #endif /* __KVM_HOST_H_FRONTIER_EXTENSION */
+
+/* 
+ * /* [Frontier] 7.(可能和上面那几条不在同一个 kvm_host.h 文件里)
+ * 必须与 kvm_host.h 中的 copyset_t 定义保持一致。
+ * 之前的 uint16_t 只能存 16 个节点，现在需要存 10240 个节点。
+ */
+
+typedef struct tx_add {
+#ifdef IVY_KVM_DSM
+    /* 
+     * [修改] 直接嵌入结构体 
+     * 这里会占用约 1280 字节，网络层必须支持发送这么大的包头 
+     */
+    copyset_t inv_copyset;
+    
+    /* [修改] 升级为 32 位以匹配 kvm_host.h 的定义 */
+    uint32_t version;
+    
+#elif defined(TARDIS_KVM_DSM)
+    /* 
+     * Tardis 模式如果不用 copyset，保留 Padding 即可。
+     * 但建议检查 Tardis 逻辑是否也受影响。
+     */
+    uint16_t padding;
+#endif
+
+    /*
+     * (Hopefully) unique transcation id
+     */
+    uint16_t txid;
+
+} __attribute__((packed)) tx_add_t; /* [必须] 强制紧凑对齐 */
 ```
 
 ---
@@ -82,10 +119,41 @@ extern struct kmem_cache *dsm_resp_cache;
 
 #### A. 辅助函数与头文件
 
+**[原代码 / Original]** (逻辑概要)
+```c
+/* 见 kvm_dsm_fetch */
+retry:
+		ret = reliable_recv(*conn_sock, &tx_add, sizeof(tx_add_t));
+        if (ret != sizeof(tx_add_t)) {
+			retry_cnt++;
+			if (retry_cnt > 100000) {
+				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
+						"kvm %d for too LONG",
+						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
+				retry_cnt = 0;
+			}
+			goto retry;
+		}
+```
+
 **[修改后 / Modified]** (直接添加在文件头部)
 ```c
+/* ivy.c 头部 */
+
+/* ... includes ... */
+
+/* 
+ * [删除/注释] 原来的结构体定义，因为已经移到 kvm_host.h 了
+ * enum kvm_dsm_request_type { ... };
+ * struct dsm_request { ... };
+ * struct dsm_response { ... };
+ */
+
+/* 确保包含修改后的头文件 */
+#include "kvm_host.h" 
 #include <linux/random.h>
 #include <linux/delay.h>
+#include <linux/sched.h>
 
 /* 
  * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
@@ -122,8 +190,18 @@ static inline void inject_jitter(void) {
 /* [修改] 适配结构体 */
 static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn, int id)
 {
-    set_bit(id, slot->vfn_dsm_state[vfn - slot->base_vfn].copyset.bits);
-    /* set_bit(id, dsm_get_copyset(slot, vfn)->bits); */
+    copyset_t *cs = dsm_get_copyset(slot, vfn);
+    
+    /* [Frontier 新增] 熔断机制 (可能有逻辑错误，删掉)
+     * 如果一个页面已经被超过 128 个节点共享，拒绝新的节点加入共享集。
+     * 新节点将被迫向 owner 发起单播读取，而不是加入 copyset。
+     * 目的：防止后续发生 Write 时，Owner 需要发送 10000 个 Invalidation 包导致系统卡死。
+     
+    if (bitmap_weight(cs->bits, DSM_MAX_INSTANCES) > 128) {
+        return;
+    } */
+
+    set_bit(id, cs->bits);
 }
 
 /* [修改] 适配结构体 */
@@ -131,6 +209,42 @@ static inline void dsm_clear_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn
 {
     bitmap_zero(dsm_get_copyset(slot, vfn)->bits, DSM_MAX_INSTANCES);
 }
+
+/* [添加] 暴力接收：死循环直到读够 data_len 长度 */
+static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
+    int received = 0;
+    int ret = 0;
+    struct kvec iov;
+    struct msghdr msg;
+
+    while (received < data_len) {
+        iov.iov_base = (char*)data + received;
+        iov.iov_len = data_len - received;
+        
+        memset(&msg, 0, sizeof(msg));
+        /* MSG_WAITALL 在内核中告诉 TCP 栈尽可能多读 */
+        ret = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, MSG_WAITALL);
+
+        if (ret <= 0) {
+            return ret; /* 连接断了或者真出错了 */
+        }
+        received += ret;
+    }
+    return received;
+}
+
+/* 修改 kvm_dsm_fetch */
+retry:
+        ret = reliable_recv(*conn_sock, &tx_add, sizeof(tx_add_t));
+        if (ret != sizeof(tx_add_t)) {
+            retry_cnt++;
+            if (retry_cnt > 100000) {
+                 printk_ratelimited(KERN_WARNING "kvm-dsm: heavy network congestion waiting for node %d\n", dest_id);
+                 cond_resched();
+            }
+            // cpu_relax(); // 通知 CPU 处于忙等待状态，节省功耗
+            goto retry;
+        }
 ```
 
 #### B. 失效广播逻辑 (修复遍历 Bug)
@@ -152,13 +266,21 @@ static void kvm_dsm_invalidate(struct kvm *kvm,
         .version = dsm_get_version(slot, vfn),
     };
 
-    /* [关键修复] 遍历 copyset->bits，防止指针类型不匹配 */
+    /* 修改 ivy.c 中的循环 */
+    int loop_cnt = 0;
     for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
-        if (holder == kvm->arch.dsm_id)
-            continue;
+        if (holder == kvm->arch.dsm_id) continue;
+    
         kvm_dsm_send_req(kvm, holder, &req, NULL);
-    }
 
+        /* 每发送 64 个包喂一次狗，而不是 1000 个 */
+        /* 1000 个包可能已经耗时 10ms+，有风险 */
+        if (++loop_cnt % 64 == 0) { 
+            touch_nmi_watchdog();
+            // cpu_relax(); // 让超线程兄弟喘口气
+            cond_resched(); //我也不知道要不要加
+        }
+    }
     dsm_clear_copyset(slot, vfn);
 }
 ```
@@ -188,7 +310,7 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
     
     /* [Frontier] 改为指针，从专用 Slab Cache 分配 */
     struct dsm_response *resp;
-    resp = kmem_cache_zalloc(dsm_resp_cache, GFP_KERNEL);
+    resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
     if (!resp) return -ENOMEM;
 
     /* [Frontier] 插入抖动，防止拥塞 */
@@ -275,7 +397,7 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 	struct dsm_response *resp;
 
 	/* [Frontier] 2. 从专用 Slab Cache 分配 */
-	resp = kmem_cache_zalloc(dsm_resp_cache, GFP_KERNEL);
+	resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
 	if (!resp) return -ENOMEM;
 
     /* [Frontier] 3. 注入微抖动 (可选，与 Write 保持一致) */
@@ -528,6 +650,7 @@ void dsm_universal_register(void *ptr, size_t size);
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "dsm_backend.h"
+#include <time.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <linux/userfaultfd.h>
@@ -538,157 +661,239 @@ void dsm_universal_register(void *ptr, size_t size);
 #include <arpa/inet.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <signal.h>
+#include <poll.h>
+
+#define _GNU_SOURCE 
+#include <endian.h>
 
 #ifndef __NR_userfaultfd
 #define __NR_userfaultfd 323
 #endif
 
-// 配置参数
-#define PREFETCH 32
+/* === 配置区域 === */
+#define PREFETCH 32           // 预取页面数量 (32 * 4KB = 128KB)
 #define PAGE_SIZE 4096
+#define MAX_OPEN_SOCKETS 10240 // 允许同时保持的最大连接数
+#define WORKER_THREADS 64     // UFFD 处理线程数
 
-// 服务端 IP 列表 (应修改为实际 IP 地址)
-const char *NODE_IPS[] = { "192.168.1.10", "192.168.1.11" }; 
+// 节点 IP 列表 (请按实际情况填写)
+const char *NODE_IPS[] = { 
+    "192.168.1.101", 
+    "192.168.1.102", 
+    // ... 更多节点
+}; 
 #define NODE_COUNT (sizeof(NODE_IPS)/sizeof(NODE_IPS[0]))
 
-int gvm_mode = 0; 
+/* === 全局变量 === */
+int gvm_mode = 0;              // 0: Kernel Mode, 1: User Mode
 int uffd_fd = -1;
-int *global_sockets = NULL; 
-pthread_mutex_t *conn_locks = NULL; 
+int *global_sockets = NULL;    // 存储 socket fd
+pthread_mutex_t *conn_locks = NULL; // 每个节点的专用锁
+int active_node_ids[MAX_OPEN_SOCKETS]; 
+int next_victim_idx = 0;
+pthread_mutex_t lru_lock = PTHREAD_MUTEX_INITIALIZER; 
 
-/* [Frontier] 用户态抖动函数 */
-static void inject_jitter(void) {
-    if (rand() % 100 < 20) { // 20% 概率引入微小延迟
-        usleep(rand() % 10);
-    }
-}
-
+/* 
+ * 建立连接底层函数 
+ * 包含：超时设置、KeepAlive、NoDelay
+ */
 static int connect_node_impl(const char *ip) {
-    /* 1. 创建 Socket */
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
 
-    /* --- 原有优化配置 --- */
-    int f = 1, b = 4 * 1024 * 1024;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&f, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&b, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&b, sizeof(int));
+    /* 1. 暴力复位 (Linger 0)，防止 TIME_WAIT 耗尽端口 */
+    struct linger sl = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
-    /* --- [关键新增] 1. TCP KeepAlive 配置 --- */
-    /* 防止交换机静默丢弃空闲连接导致 QEMU 永久卡死 */
-    int keepalive = 1;
-    int keepidle = 10;   // 10秒无数据就开始探测 (比之前的60秒更激进，适应游戏场景)
-    int keepintvl = 2;   // 探测间隔2秒
-    int keepcnt = 3;     // 探测3次失败认为连接断开
+    /* 2. 基础性能优化 */
+    int flag = 1, bufsize = 4 * 1024 * 1024;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(int));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(int));
+
+    /* 3. KeepAlive (防止静默断开) */
+    int keepalive = 1, keepidle = 5, keepintvl = 2, keepcnt = 3;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(int));
     setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
     setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
     setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
 
-    /* --- [关键新增] 2. 读写超时配置 --- */
-    /* 防止网络拥塞时 recv 无限阻塞导致虚拟机 "Hard Hang" */
+    /* 4. [FIX] 读写超时 (防止死锁的关键) */
     struct timeval timeout;
-    timeout.tv_sec = 5;  // 5秒超时。如果在5秒内还没读到数据，recv返回错误
+    timeout.tv_sec = 2;  // 2秒无响应即视为断开，触发重连
     timeout.tv_usec = 0;
-    
-    // 设置接收超时 (这是保命的关键)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-    // 设置发送超时 (防止发包缓冲区满时卡死)
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
 
-    /* 2. 准备地址 */
     struct sockaddr_in a;
     a.sin_family = AF_INET;
     a.sin_port = htons(9999);
     inet_pton(AF_INET, ip, &a.sin_addr);
 
-    /* 3. 发起连接 */
     if (connect(s, (struct sockaddr*)&a, sizeof(a)) < 0) { 
         close(s); 
         return -1; 
     }
-}
-
-static int get_or_connect(int node_id) {
-    if (node_id < 0 || node_id >= NODE_COUNT) return -1;
-    pthread_mutex_lock(&conn_locks[node_id]);
-    static int get_or_connect(int node_id) {
-    // ... 前置检查 ...
-        pthread_mutex_lock(&conn_locks[node_id]);
-        if (global_sockets[node_id] < 0) {
-            int retries = 0;
-            int wait_time = 1000; // 1ms
-            int s = -1;
-        
-            while (retries < 5) { // 最多重试5次
-                s = connect_node_impl(NODE_IPS[node_id]);
-                if (s >= 0) break;
-            
-                /* [关键修复] 指数退避：失败后等待时间翻倍 */
-                usleep(wait_time);
-                wait_time *= 2; 
-                retries++;
-            }
-
-            if (s >= 0) {
-                global_sockets[node_id] = s;
-            } else {
-                // 严重错误：连接不上服务端
-                pthread_mutex_unlock(&conn_locks[node_id]);
-                return -1;
-            }
-        }
-    }
-    int s = global_sockets[node_id];
-    pthread_mutex_unlock(&conn_locks[node_id]);
     return s;
 }
 
+/* 
+ * [CRITICAL FIX] 获取连接并锁定
+ * 返回值: Socket FD (>=0) 表示成功，且 conn_locks[node_id] 处于 LOCKED 状态。
+ *        -1 表示失败，锁已被释放。
+ */
+static int get_or_connect_locked(int node_id) {
+    if (node_id < 0 || node_id >= NODE_COUNT) return -1;
+
+    pthread_mutex_lock(&conn_locks[node_id]);
+
+    /* 极其简单：有就用，没有就连，不需要踢人 */
+    if (global_sockets[node_id] != -1) {
+        return global_sockets[node_id];
+    }
+
+    /* 建立连接 */
+    int s = connect_node_impl(NODE_IPS[node_id]);
+    if (s >= 0) {
+        global_sockets[node_id] = s;
+        return s;
+    } else {
+        pthread_mutex_unlock(&conn_locks[node_id]);
+        return -1;
+    }
+}
+
+/* 
+ * 辅助函数：关闭连接并清理状态 
+ * 调用前必须持有 conn_locks[node_id]
+ */
+static void close_socket_locked(int node_id) {
+    int s = global_sockets[node_id];
+    if (s != -1) {
+        close(s);
+        global_sockets[node_id] = -1;
+    }
+}
+
+/* 工作线程 - 修复版 (包含重试与防死锁兜底) */
 void *dsm_worker(void *arg) {
-    struct uffd_msg msg;
-    char buf[PAGE_SIZE * PREFETCH];
+    const int BATCH_SIZE = 64;
+    struct uffd_msg msgs[BATCH_SIZE];
+    ssize_t nread;
+    
+    // 分配接收缓冲区
+    char *buf = malloc(PAGE_SIZE * PREFETCH);
+    if (!buf) return NULL;
+
+    // 提高线程优先级，确保缺页响应速度
     struct sched_param p = { .sched_priority = 10 };
     pthread_setschedparam(pthread_self(), SCHED_RR, &p);
 
+    // 随机种子用于 Jitter
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)pthread_self();
+
     while(1) {
-        if (read(uffd_fd, &msg, sizeof(msg)) != sizeof(msg)) continue;
+        /* 读取事件 */
+        struct pollfd pfd = { .fd = uffd_fd, .events = POLLIN };
+        int poll_ret = poll(&pfd, 1, 2000); // 2秒超时
         
-        if (msg.event & UFFD_EVENT_PAGEFAULT) {
-            uint64_t addr = msg.arg.pagefault.address;
+        if (poll_ret <= 0) continue;
+
+        nread = read(uffd_fd, msgs, sizeof(struct uffd_msg) * BATCH_SIZE);
+        if (nread <= 0) continue;
+
+        int n_events = nread / sizeof(struct uffd_msg);
+
+        for (int i = 0; i < n_events; i++) {
+            struct uffd_msg *msg = &msgs[i];
+            if (!(msg->event & UFFD_EVENT_PAGEFAULT)) continue;
+
+            uint64_t addr = msg->arg.pagefault.address;
             uint64_t base = addr & ~(4095);
             int owner = (base / 4096) % NODE_COUNT;
+
+            /* 1. 注入 Jitter (可选，缓解服务端并发压力) */
+            // if ((rand_r(&seed) % 100) < 5) usleep(rand_r(&seed) % 10);
+
+            /* 2. [CRITICAL FIX] 获取连接 (带重试机制) */
+            int sock = -1;
+            int retry_cnt = 0;
+            const int MAX_RETRIES = 5;
+
+            while (retry_cnt < MAX_RETRIES) {
+                sock = get_or_connect_locked(owner);
+                if (sock >= 0) break; // 成功拿到锁定的连接
+
+                retry_cnt++;
+                // 简单的线性退避: 1ms, 2ms, 3ms...
+                usleep(1000 * retry_cnt); 
+            }
             
-            inject_jitter(); // 发送前抖动
+            /* 3. [CRITICAL FIX] 兜底逻辑：防止死锁 */
+            if (sock < 0) {
+                fprintf(stderr, "[DSM] FATAL: Node %d unreachable after retries. Zero-filling %lx to unblock vCPU.\n", owner, base);
+                
+                // 必须填充一个零页，否则 vCPU 会永远停在这一行汇编指令上等待
+                struct uffdio_zeropage z = { 
+                    .range = { .start = base, .len = 4096 }, 
+                    .mode = 0 
+                };
+                if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z) < 0) {
+                    // 如果页面已存在(EEXIST)，唤醒即可
+                    if (errno == EEXIST) {
+                         struct uffdio_wake w = { .start = base, .len = 4096, .mode = 0 };
+                         ioctl(uffd_fd, UFFDIO_WAKE, &w);
+                    } else {
+                        perror("[DSM] Emergency zeropage failed");
+                    }
+                }
+                
+                // 跳过后续网络操作，处理下一个事件
+                continue; 
+            }
 
-            int sock = get_or_connect(owner);
-            if (sock < 0) continue; 
-
-            pthread_mutex_lock(&conn_locks[owner]);
+            /* 4. 发送请求 */
             uint64_t req = htobe64(base);
             if (send(sock, &req, 8, 0) != 8) {
-                close(sock);
-                global_sockets[owner] = -1;
-                pthread_mutex_unlock(&conn_locks[owner]);
+                close_socket_locked(owner); // 发送失败，标记连接失效
+                pthread_mutex_unlock(&conn_locks[owner]); // 必须解锁
+                
+                // 这里其实也可以 goto 到上面的 Zero-fill 逻辑，
+                // 但简单起见，让 VM 再触发一次缺页重试通常更安全
                 continue;
             }
 
+            /* 5. 接收数据 */
             int total = PAGE_SIZE * PREFETCH;
             int recvd = 0;
+            bool error = false;
+
             while (recvd < total) {
-                int n = recv(sock, buf + recvd, total - recvd, 0);
+                int n = recv(sock, buf + recvd, total - recvd, MSG_WAITALL);
                 if (n <= 0) {
-                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue; // 超时，继续尝试
-                    // 真正的错误，关闭 socket 触发重连
-                    close(sock);
-                    global_sockets[owner] = -1;
-                    pthread_mutex_unlock(&conn_locks[owner]);
-                    continue; // 重新进入循环，触发 get_or_connect
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                         // 超时视为连接坏死
+                    }
+                    close_socket_locked(owner); 
+                    error = true;
+                    break;
                 }
-                if (n <= 0) break;
                 recvd += n;
             }
+
+            /* 6. [CRITICAL] 任务完成，解锁 */
             pthread_mutex_unlock(&conn_locks[owner]);
 
+            if (error) {
+                // 接收失败，不进行 UFFD 操作，让 VM 指令重试，
+                // 下次重试时会重新触发 PageFault，进入重连逻辑
+                continue; 
+            }
+
+            /* 7. 填充内存 (无需锁) */
+            // 注意：虽然请求了 PREFETCH 大小，但 UFFD 只需要填充触发缺页的那个 base
+            // 不过为了性能，我们可以把预取的数据都填进去（如果内核支持）
             for(int k=0; k<PREFETCH; k++) {
                 struct uffdio_copy c = {
                     .dst = base + k*4096, 
@@ -696,43 +901,81 @@ void *dsm_worker(void *arg) {
                     .len = 4096, 
                     .mode = 0 
                 };
-                ioctl(uffd_fd, UFFDIO_COPY, &c);
+                
+                // 重点：如果目标地址超出了注册范围，或者已被映射，ioctl 会失败
+                // 我们主要关心 k=0 (当前缺页地址) 的成功
+                if (ioctl(uffd_fd, UFFDIO_COPY, &c) < 0) {
+                    if (errno == EEXIST) {
+                        // 竞争条件下，页面可能已经被别的线程填了，唤醒即可
+                        struct uffdio_wake w = { .start = c.dst, .len = c.len, .mode = 0 };
+                        ioctl(uffd_fd, UFFDIO_WAKE, &w);
+                    }
+                }
             }
         }
     }
+    free(buf);
     return NULL;
 }
 
+/* 初始化入口 */
 void dsm_universal_init(void) {
-    // 检测逻辑
+    signal(SIGPIPE, SIG_IGN); // 忽略 Broken Pipe
+
+    /* 检测内核模块是否存在 */
     if (access("/sys/module/giantvm_kvm", F_OK) == 0 || access("/dev/giantvm", F_OK) == 0) {
         printf("[GiantVM] KERNEL MODULE DETECTED. Using ORIGINAL FULL-SHARE Mode.\n");
         gvm_mode = 0; 
         return; 
     }
-    printf("[GiantVM] NO KERNEL MODULE. Using MEMORY-ONLY Mode.\n");
-    gvm_mode = 1;
+
+    printf("[GiantVM] NO KERNEL MODULE. Using MEMORY-ONLY Mode (Frontier Fixed).\n");
+    gvm_mode = 1; 
     
     uffd_fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-    if (uffd_fd >= 0) {
-        struct uffdio_api api = { .api = UFFD_API, .features = 0 };
-        ioctl(uffd_fd, UFFDIO_API, &api);
-        
-        global_sockets = malloc(sizeof(int) * NODE_COUNT);
-        conn_locks = malloc(sizeof(pthread_mutex_t) * NODE_COUNT);
-        
-        for(int i=0; i<NODE_COUNT; i++) {
-            global_sockets[i] = -1;
-            pthread_mutex_init(&conn_locks[i], NULL);
-        }
-        for(int i=0; i<8; i++) qemu_thread_create(NULL, "dsm-w", dsm_worker, NULL, QEMU_THREAD_JOINABLE);
+    if (uffd_fd < 0) {
+        perror("[GiantVM] userfaultfd syscall failed");
+        return;
+    }
+
+    struct uffdio_api api = { .api = UFFD_API, .features = 0 };
+    if (ioctl(uffd_fd, UFFDIO_API, &api) < 0) {
+        perror("[GiantVM] uffdio_api failed");
+        close(uffd_fd);
+        uffd_fd = -1;
+        return;
+    }
+    
+    /* 分配全局结构 */
+    global_sockets = malloc(sizeof(int) * NODE_COUNT);
+    conn_locks = malloc(sizeof(pthread_mutex_t) * NODE_COUNT);
+    
+    if (!global_sockets || !conn_locks) abort(); // OOM 必须死
+
+    for(int i=0; i<NODE_COUNT; i++) {
+        global_sockets[i] = -1;
+        pthread_mutex_init(&conn_locks[i], NULL);
+    }
+    for(int i=0; i<MAX_OPEN_SOCKETS; i++) {
+        active_node_ids[i] = -1;
+    }
+
+    /* 启动 Worker 线程 */
+    for(int i=0; i < WORKER_THREADS; i++) {
+        qemu_thread_create(NULL, "dsm-w", dsm_worker, NULL, QEMU_THREAD_JOINABLE);
     }
 }
 
+/* 注册内存区域 */
 void dsm_universal_register(void *ptr, size_t size) {
     if (gvm_mode == 1 && uffd_fd >= 0) {
-        struct uffdio_register r = { .range = {(uint64_t)ptr, size}, .mode = UFFDIO_REGISTER_MODE_MISSING };
-        ioctl(uffd_fd, UFFDIO_REGISTER, &r);
+        struct uffdio_register r = { 
+            .range = {(uint64_t)ptr, size}, 
+            .mode = UFFDIO_REGISTER_MODE_MISSING 
+        };
+        if (ioctl(uffd_fd, UFFDIO_REGISTER, &r) < 0) {
+             perror("[GiantVM] register memory failed");
+        }
     }
 }
 ```
@@ -789,6 +1032,11 @@ void dsm_universal_register(void *ptr, size_t size) {
 #include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <time.h>
+#include <signal.h>
+
+#define _GNU_SOURCE 
+#include <endian.h>
 
 #define MAX_EVENTS 10240
 #define PORT 9999
@@ -803,6 +1051,7 @@ int set_nonblocking(int fd) {
 }
 
 int main() {
+    signal(SIGPIPE, SIG_IGN);
     int listen_sock, conn_sock, nfds, epollfd;
     struct epoll_event ev, events[MAX_EVENTS];
     struct sockaddr_in addr;
@@ -813,6 +1062,12 @@ int main() {
     off_t file_size = lseek(fd_mem, 0, SEEK_END);
     char *mem_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd_mem, 0);
     if (mem_ptr == MAP_FAILED) { perror("mmap"); return 1; }
+
+    /* [Frontier 新增] 开启大页与预读优化 */
+    /* 作用：将 TLB Miss 减少 99%，防止 CPU 卡在页表查找上 */
+    madvise(mem_ptr, file_size, MADV_HUGEPAGE); 
+    madvise(mem_ptr, file_size, MADV_RANDOM);   // 告诉内核：这是随机访问，别做顺序预读
+    madvise(mem_ptr, file_size, MADV_WILLNEED); // 告诉内核：我会用到这些内存，尽快换入
 
     listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     
@@ -845,40 +1100,68 @@ int main() {
 
         for (int n = 0; n < nfds; ++n) {
             if (events[n].data.fd == listen_sock) {
-                conn_sock = accept(listen_sock, (struct sockaddr *)&addr, &addrlen);
-                if (conn_sock == -1) continue;
-                set_nonblocking(conn_sock);
-                
-                int flag = 1;
-                setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+                while (1) {
+                    conn_sock = accept(listen_sock, (struct sockaddr *)&addr, &addrlen);
+                    if (conn_sock == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 处理完了
+                        perror("accept"); break;
+                    }
+        
+                    set_nonblocking(conn_sock);
+                    int flag = 1;
+                    setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
 
-                ev.events = EPOLLIN | EPOLLET;
-                ev.data.fd = conn_sock;
-                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) {
-                    close(conn_sock);
+                    ev.events = EPOLLIN | EPOLLET; // 保持边缘触发
+                    ev.data.fd = conn_sock;
+                    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) {
+                        close(conn_sock);
+                    }
                 }
             } else {
                 int fd = events[n].data.fd;
                 /* [CRITICAL FIX] 循环读取直到 EAGAIN */
                 while (1) {
                     uint64_t req_addr_be;
-                    ssize_t count = recv(fd, &req_addr_be, 8, 0);
+                    ssize_t count = recv(fd, &req_addr_be, 8, MSG_WAITALL);
                     
                     if (count == 8) {
                         uint64_t base = be64toh(req_addr_be);
                         if (base + PAGE_SIZE * PREFETCH > file_size) base = 0; 
                         
-                        /* 发送也要处理部分写入的情况，虽然在这里概率较低，但严谨起见 */
                         size_t total_to_send = PAGE_SIZE * PREFETCH;
                         size_t sent_total = 0;
                         char *send_ptr = mem_ptr + base;
+
+                        /* [修改后] 基于时间的宽容超时逻辑 */
+                        struct timespec ts_start = {0}, ts_now;
+                        
                         while(sent_total < total_to_send) {
                             ssize_t s = send(fd, send_ptr + sent_total, total_to_send - sent_total, 0);
                             if (s < 0) {
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                                close(fd); goto next_event; // 连接断开
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    /* 第一次遇到阻塞时，记录当前时间 */
+                                    if (ts_start.tv_sec == 0) {
+                                        clock_gettime(CLOCK_MONOTONIC, &ts_start);
+                                    }
+                                    
+                                    /* 检查是否超时 */
+                                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                                    if (ts_now.tv_sec - ts_start.tv_sec > 5) {
+                                        // 阻塞超过 5 秒，判定为死链接，断开
+                                        close(fd); goto next_event; 
+                                    }
+                                    
+                                    /* 增加睡眠时间到 50us，避免 CPU 空转过热 */
+                                    usleep(50); 
+                                    continue; 
+                                }
+                                // 其他错误直接断开
+                                close(fd); goto next_event;
                             }
+                            
                             sent_total += s;
+                            /* 只要成功发送了数据，重置超时计时器，给下一次发送机会 */
+                            ts_start.tv_sec = 0; 
                         }
                     } else if (count < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 读空了，退出循环等待下一次事件
@@ -916,6 +1199,10 @@ sudo apt-get update
 sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev \
     pkg-config libglib2.0-dev libpixman-1-dev libpython3-dev libaio-dev libcap-ng-dev \
     libattr1-dev libcap-dev python3-venv python3-pip
+# 必须大于等于你代码里的 listen 参数
+sysctl -w net.core.somaxconn=65535
+
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 
 # 2. 系统参数调优 (防止万节点连接耗尽资源)
 # 将以下内容追加到 /etc/sysctl.conf
@@ -925,19 +1212,19 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_tw_reuse = 1
 net.core.somaxconn = 65535
 vm.max_map_count = 262144
-# 1. ARP 表扩容 (关键！默认只有 1024，万节点必崩)
 net.ipv4.neigh.default.gc_thresh1 = 4096
 net.ipv4.neigh.default.gc_thresh2 = 8192
-net.ipv4.neigh.default.gc_thresh3 = 16384  # 必须大于节点数 10240
-# 2. 连接跟踪表扩容 (防止大量短连接导致丢包)
+net.ipv4.neigh.default.gc_thresh3 = 16384
 net.netfilter.nf_conntrack_max = 1048576
 net.nf_conntrack_max = 1048576
-# 3. 孤儿 Socket 处理 (防止 Reset 风暴耗尽内存)
 net.ipv4.tcp_max_orphans = 262144
-# 4. 允许更快的端口回收 (配合代码里的重试逻辑)
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
-# 6. 开启 BBR (这对高延迟/丢包环境的吞吐量至关重要)
+net.ipv4.tcp_mem = 4194304 6291456 8388608
+net.ipv4.tcp_wmem = 4096 16384 4194304
+net.ipv4.tcp_rmem = 4096 87380 6291456
+net.ipv4.tcp_max_syn_backlog = 65536
+net.core.netdev_max_backlog = 65536
 echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
 echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a 
 EOF
@@ -958,7 +1245,30 @@ EOF
 **适用场景：** 分布式操作系统研究、跨节点内存/CPU 聚合。
 **架构：** L0 (物理机) -> L1 (GiantVM 宿主机集群) -> L2 (GiantVM 客户机)。
 
-**步骤 1：L1 环境准备**
+**步骤 1：L0 环境准备**
+1.  **物理机端口扩容：**
+    在 L0 物理机上，必须扩大端口范围，否则无法支撑全连接：
+    ```bash
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+    ```
+
+2.  **关闭 NMI Watchdog：**
+    为了防止发送大量广播包时 CPU 卡死被看门狗咬死：
+    ```bash
+    sysctl -w kernel.nmi_watchdog=0
+    sysctl -w kernel.softlockup_panic=0
+    ```
+
+3.  **增加 ARP 表大小：**
+    10,000 个节点意味着 10,000 个 IP。默认的 ARP 表只有 1024 或 4096，填满后网络会断。
+    ```bash
+    sysctl -w net.ipv4.neigh.default.gc_thresh1=4096
+    sysctl -w net.ipv4.neigh.default.gc_thresh2=8192
+    sysctl -w net.ipv4.neigh.default.gc_thresh3=16384
+    ```
+
+
+**步骤 2：L1 环境准备**
 在所有 L1 节点上安装编译好的内核模块：
 ```bash
 cd giantvm-kvm/
@@ -966,7 +1276,7 @@ make -j
 sudo insmod giantvm-kvm.ko
 ```
 
-**步骤 2：配置集群 (cluster.conf)**
+**步骤 3：配置集群 (cluster.conf)**
 创建一个描述所有 L1 节点信息的配置文件 `cluster.conf`：
 ```text
 # 格式: ID IP PORT
@@ -976,8 +1286,8 @@ sudo insmod giantvm-kvm.ko
 ...
 ```
 
-**步骤 3：启动 GiantVM**
-在每个 L1 节点上运行对应的 QEMU 命令。
+**步骤 4：启动 GiantVM**
+在每个 L1 节点上运行对应的 QEMU 命令。(编译 QEMU 具体参数见流程 B 的步骤 2)
 *注意：必须为每个节点指定不同的 `-giantvm-id`。*
 
 ```bash
@@ -1057,11 +1367,29 @@ sudo insmod giantvm-kvm.ko
     如果返回 `succeeded`，说明端口通了。
 
 **步骤 2：客户端 (Compute Node) 准备**
-*   **卸载内核模块：** 确保 `/dev/giantvm` 不存在。
-    ```bash
-    sudo rmmod giantvm-kvm
-    ```
-*   **修改代码中的 IP：** 确保 `qemu/dsm_backend.c` 中的 `NODE_IPS` 指向了服务端 IP，并重新编译 QEMU。
+```bash
+# 1. 卸载内核模块
+sudo rmmod giantvm-kvm
+
+# 2. 修改代码 IP (确保 dsm_backend.c 指向正确服务端)
+# ... 编辑文件操作 ...
+
+# 3. [关键新增] 重新编译 QEMU (必须强制扩容句柄限制)
+cd qemu/
+make clean  # 清理旧的编译缓存，防止宏未生效
+
+# 配置编译环境 (必须加上 --extra-cflags)
+./configure \
+  --target-list=x86_64-softmmu \
+  --enable-kvm \
+  --enable-vnc \
+  --disable-werror \
+  --extra-cflags="-O3 -D__FD_SETSIZE=65536 -DFD_SETSIZE=65536" \
+  --python=/usr/bin/python3
+
+# 开始编译
+make -j$(nproc)
+```
 
 **步骤 3：启动客户端**
 ```bash
@@ -1200,7 +1528,7 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
       - 运行 Star Citizen.exe (CPU 逻辑)
       - 拦截 GPU 调用 -> 发送给 L1
       - 内存：分布在 Node0/1 上 (RDMA 加速)
-      - 磁盘：Ramdisk (避免 I/O 由 L1 划分)
+      - 磁盘：Ramdisk (避免 I/O)
 ```
 
 #### 预期效果评估
@@ -1212,4 +1540,3 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
 
 **一句话总结配置核心：**
 **用 RDMA 救 CPU 和内存，用 Sunshine+VirtualGL 旁路推流救显卡，用 Ramdisk 救硬盘。** 祝你好运，公民！
-
