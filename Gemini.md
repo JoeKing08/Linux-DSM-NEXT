@@ -1201,7 +1201,7 @@ sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev lib
     libattr1-dev libcap-dev python3-venv python3-pip
 # 必须大于等于你代码里的 listen 参数
 sysctl -w net.core.somaxconn=65535
-
+sysctl -w net.ipv4.tcp_syn_retries=2
 sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 
 # 2. 系统参数调优 (防止万节点连接耗尽资源)
@@ -1518,8 +1518,8 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
        |
 【L1 宿主机 (Node 1)】 <---(RDMA 极速同步)---> 【L1 宿主机 (Node 0)】
    |  [NVIDIA 4090]                                  |
-   |  (运行 X Server + VirtualGL Server)             |
-   |  (运行 Sunshine 推流服务)                        |
+   |  (运行 X Server + VirtualGL Server)              |
+   |  (运行 Sunshine 推流服务)                         |
    |                                                 |
    +-------------------------------------------------+
            | (VirtualGL 传输渲染指令)
@@ -1528,7 +1528,7 @@ Windows 10 对 GiantVM 来说是“噪音之王”。必须进行外科手术式
       - 运行 Star Citizen.exe (CPU 逻辑)
       - 拦截 GPU 调用 -> 发送给 L1
       - 内存：分布在 Node0/1 上 (RDMA 加速)
-      - 磁盘：Ramdisk (避免 I/O)
+      - 磁盘：Ramdisk (避免 I/O))
 ```
 
 #### 预期效果评估
