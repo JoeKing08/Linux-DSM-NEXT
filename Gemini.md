@@ -119,23 +119,6 @@ typedef struct tx_add {
 
 #### A. 辅助函数与头文件
 
-**[原代码 / Original]** (逻辑概要)
-```c
-/* 见 kvm_dsm_fetch */
-retry:
-		ret = reliable_recv(*conn_sock, &tx_add, sizeof(tx_add_t));
-        if (ret != sizeof(tx_add_t)) {
-			retry_cnt++;
-			if (retry_cnt > 100000) {
-				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
-						"kvm %d for too LONG",
-						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
-				retry_cnt = 0;
-			}
-			goto retry;
-		}
-```
-
 **[修改后 / Modified]** (直接添加在文件头部)
 ```c
 /* ivy.c 头部 */
@@ -154,6 +137,10 @@ retry:
 #include <linux/random.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
+#include <linux/nmi.h>
+#include <linux/sched.h>
+#include <linux/watchdog.h>
+#include <linux/delay.h>
 
 /* 
  * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
@@ -234,54 +221,196 @@ static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
 }
 
 /* 修改 kvm_dsm_fetch */
-retry:
-        ret = reliable_recv(*conn_sock, &tx_add, sizeof(tx_add_t));
-        if (ret != sizeof(tx_add_t)) {
-            retry_cnt++;
-            if (retry_cnt > 100000) {
-                 printk_ratelimited(KERN_WARNING "kvm-dsm: heavy network congestion waiting for node %d\n", dest_id);
-                 cond_resched();
-            }
-            // cpu_relax(); // 通知 CPU 处于忙等待状态，节省功耗
-            goto retry;
+static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
+		const struct dsm_request *req, void *data, struct dsm_response *resp)
+{
+	kconnection_t **conn_sock;
+	int ret;
+	tx_add_t tx_add = {
+		.txid = generate_txid(kvm, dest_id),
+	};
+	int retry_cnt = 0;
+    
+    /* [Frontier] 定义上下文标志 */
+    int send_flags = 0;
+    int recv_flags = 0;
+    bool is_atomic = false;
+
+	if (kvm->arch.dsm_stopped)
+		return -EINVAL;
+
+    /* [Frontier] 检测原子上下文 */
+    if (in_atomic() || irqs_disabled()) {
+        is_atomic = true;
+        send_flags = MSG_DONTWAIT; /* 关键：禁止睡眠 */
+        recv_flags = MSG_DONTWAIT;
+    }  else {
+        /* 非原子上下文，保持原作者的习惯 */
+        send_flags = 0; 
+        recv_flags = SOCK_NONBLOCK; 
+    }
+
+	if (!from_server)
+		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
+	else {
+		conn_sock = &kvm->arch.dsm_conn_socks[DSM_MAX_INSTANCES + dest_id];
+	}
+
+	if (*conn_sock == NULL) {
+        /* [Frontier] 原子上下文无法获取互斥锁建立连接，必须放弃 */
+        if (is_atomic) return -ENOTCONN;
+
+		mutex_lock(&kvm->arch.conn_init_lock);
+		if (*conn_sock == NULL) {
+			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
+			if (ret < 0) {
+				mutex_unlock(&kvm->arch.conn_init_lock);
+				return ret;
+			}
+		}
+		mutex_unlock(&kvm->arch.conn_init_lock);
+	}
+
+	dsm_debug_v("kvm[%d] sent request[0x%x] to kvm[%d] req_type[%s] gfn[%llu,%d]",
+			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
+			req->gfn, req->is_smm);
+
+    /* [Frontier] 发送阶段：忙等待保护 */
+retry_send:
+	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
+				dsm_request), send_flags, &tx_add);
+    
+    if (ret == -EAGAIN && is_atomic) {
+        cpu_relax();
+        touch_nmi_watchdog();        /* 防止硬死锁重启 */
+        touch_softlockup_watchdog(); /* [新增] 防止软死锁报错 */
+        goto retry_send;             /* 死磕直到缓冲区有空位 */
+    }
+	if (ret < 0)
+		goto done;
+
+	retry_cnt = 0;
+    
+    /* [Frontier] 接收阶段：忙等待保护 */
+	if (req->req_type == DSM_REQ_INVALIDATE) {
+retry_recv_inv:
+		ret = network_ops.receive(*conn_sock, data, recv_flags, &tx_add);
+        if (ret == -EAGAIN && is_atomic) {
+            cpu_relax();
+            touch_nmi_watchdog();
+            touch_softlockup_watchdog(); /* [新增] */
+            goto retry_recv_inv;
         }
+	}
+	else {
+retry:
+		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
+		if (ret == -EAGAIN) {
+			retry_cnt++;
+            
+            /* [Frontier] 原子上下文死等逻辑 */
+            if (is_atomic) {
+                cpu_relax();
+                touch_nmi_watchdog();
+                touch_softlockup_watchdog(); /* [新增] */
+                goto retry;
+            }
+
+            /* 原有逻辑：普通上下文超时检测 */
+			if (retry_cnt > 100000) {
+				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
+						"kvm %d for too LONG",
+						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
+				retry_cnt = 0;
+			}
+			goto retry;
+		}
+		resp->inv_copyset = tx_add.inv_copyset;
+		resp->version = tx_add.version;
+	}
+	if (ret < 0)
+		goto done;
+
+done:
+	return ret;
+}
 ```
 
 #### B. 失效广播逻辑 (修复遍历 Bug)
 **【替换说明】** 找到 `kvm_dsm_invalidate` 函数，全量替换。
 
 ```c
-static void kvm_dsm_invalidate(struct kvm *kvm,
-        struct kvm_dsm_memory_slot *slot, hfn_t vfn)
+/*
+ * kvm_dsm_invalidate - issued by owner of a page to invalidate all of its copies
+ * [Frontier Modified] 使用安全循环防止万节点死锁
+ */
+static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req_id)
 {
-    unsigned long holder;
-    /* [修改] 获取结构体指针 */
-    copyset_t *copyset = dsm_get_copyset(slot, vfn);
+	int holder;
+	int ret = 0;
+	char r = 1; /* Dummy buffer for ACK */
+	copyset_t *copyset;
+	struct dsm_response resp; /* Placeholder, not used for invalidate */
     
-    struct dsm_request req = {
-        .req_type = DSM_REQ_INVALIDATE,
-        .requester = kvm->arch.dsm_id,
-        .msg_sender = kvm->arch.dsm_id,
-        .gfn = slot->base_gfn + (vfn - slot->base_vfn),
-        .version = dsm_get_version(slot, vfn),
-    };
-
-    /* 修改 ivy.c 中的循环 */
+    /* 循环计数器，用于 watchdog */
     int loop_cnt = 0;
-    for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
-        if (holder == kvm->arch.dsm_id) continue;
-    
-        kvm_dsm_send_req(kvm, holder, &req, NULL);
 
-        /* 每发送 64 个包喂一次狗，而不是 1000 个 */
-        /* 1000 个包可能已经耗时 10ms+，有风险 */
+	copyset = cpyset ? cpyset : dsm_get_copyset(slot, vfn);
+
+    /* 
+     * [Frontier 修正] 
+     * 1. 使用 touch_softlockup_watchdog 防止内核报 "CPU stuck" 
+     * 2. 只有在确实安全的时候才调度
+     */
+	for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
+		
+        /* 构造请求结构体 */
+        struct dsm_request req = {
+			.req_type = DSM_REQ_INVALIDATE,
+			.requester = kvm->arch.dsm_id,
+			.msg_sender = kvm->arch.dsm_id,
+			.gfn = gfn,
+			.is_smm = is_smm,
+			.version = dsm_get_version(slot, vfn),
+		};
+        
+		if (kvm->arch.dsm_id == holder)
+			continue;
+        
+		/* Sanity check on copyset consistency. */
+		BUG_ON(holder >= kvm->arch.cluster_iplist_len);
+
+        /* 
+         * [Frontier] 调用改造后的 kvm_dsm_fetch 
+         * 此时它内部会自动使用 MSG_DONTWAIT，并在缓冲区满时 cpu_relax()
+         */
+		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
+		if (ret < 0)
+			return ret;
+
+        /* 每发送 64 个包检查一次状态 */
         if (++loop_cnt % 64 == 0) { 
-            touch_nmi_watchdog();
-            // cpu_relax(); // 让超线程兄弟喘口气
-            cond_resched(); //我也不知道要不要加
+            
+            /* [关键新增 1] 同时喂 NMI 狗和 Softlockup 狗 */
+            touch_nmi_watchdog();        // 防止硬死锁检测重启
+            touch_softlockup_watchdog(); // [必须加] 防止软死锁检测报错
+            
+            /* [关键新增 2] 严格的上下文检查 */
+            /* 如果我们在中断上下文、持有自旋锁或禁止抢占状态，绝对不能调度 */
+            if (!in_atomic() && !irqs_disabled()) {
+                cond_resched();
+            } else {
+                /* 
+                 * 如果持有自旋锁 (Spinlock Held)，我们不能释放 CPU，
+                 * 只能通过 cpu_relax() 通知 CPU 流水线歇口气。
+                 */
+                cpu_relax(); 
+            }
         }
-    }
-    dsm_clear_copyset(slot, vfn);
+	}
+
+	return 0;
 }
 ```
 
