@@ -73,6 +73,10 @@
 MODULE_AUTHOR("Qumranet");
 MODULE_LICENSE("GPL");
 
+/* [Frontier] 定义 DSM 专用缓存池 */
+struct kmem_cache *dsm_resp_cache;
+EXPORT_SYMBOL_GPL(dsm_resp_cache);
+
 /* Architectures should define their poll value according to the halt latency */
 static unsigned int halt_poll_ns = KVM_HALT_POLL_NS_DEFAULT;
 module_param(halt_poll_ns, uint, S_IRUGO | S_IWUSR);
