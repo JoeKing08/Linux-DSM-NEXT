@@ -35,6 +35,10 @@
 #include <asm/asm.h>
 #include <asm/kvm_page_track.h>
 
+#include <linux/bitmap.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+
 #define KVM_MAX_VCPUS 288
 #define KVM_SOFT_MAX_VCPUS 240
 #define KVM_MAX_VCPU_ID 1023
@@ -707,27 +711,77 @@ typedef uint32_t timestamp_t;
 #define KVM_DSM_DIFF
 #define KVM_DSM_PF_PROFILE
 
-#define DSM_MAX_INSTANCES 16
+#define DSM_MAX_INSTANCES 10240
 
-/*
- * Besides data, each transation is binded with an addtional data structure.
+typedef struct {
+    unsigned long bits[BITS_TO_LONGS(DSM_MAX_INSTANCES)];
+} copyset_t;
+
+/* [Frontier] 3. 搬运枚举定义 */
+enum kvm_dsm_request_type {
+	DSM_REQ_INVALIDATE,
+	DSM_REQ_READ,
+	DSM_REQ_WRITE,
+};
+
+/* 
+ * [Frontier Critical Fix] 
+ * 1. 加上 __attribute__((packed)) 防止编译器填充字节导致协议错位。
+ * 2. version 升级为 uint32_t 防止高频读写回绕。
  */
+
+/* [Frontier] 4. 搬运并强化 Request 结构体 */
+struct dsm_request {
+	unsigned char requester;
+	unsigned char msg_sender;
+	gfn_t gfn;
+	unsigned char req_type;
+	bool is_smm;
+	uint32_t version;     /* Fix: 从 uint16_t 升级为 uint32_t */
+} __attribute__((packed)); /* Fix: 强制对齐 */
+
+/* [Frontier] 5. 搬运并强化 Response 结构体 */
+struct dsm_response {
+	copyset_t inv_copyset;
+	uint32_t version;     /* Fix: 从 uint16_t 升级为 uint32_t */
+} __attribute__((packed)); /* Fix: 强制对齐 */
+
+/* [Frontier] 6. 声明全局缓存池变量 (供 ivy.c 使用) */
+extern struct kmem_cache *dsm_resp_cache;
+
+#endif /* __KVM_HOST_H_FRONTIER_EXTENSION */
+
+/* 
+ * /* [Frontier] 7.(可能和上面那几条不在同一个 kvm_host.h 文件里)
+ * 必须与 kvm_host.h 中的 copyset_t 定义保持一致。
+ * 之前的 uint16_t 只能存 16 个节点，现在需要存 10240 个节点。
+ */
+
 typedef struct tx_add {
 #ifdef IVY_KVM_DSM
-	/* Nodes indicated by inv_copyset should be sent INV messages upon write
-	 * fault. It's also used to transfer the complete copyset upon read fault. */
-	uint16_t inv_copyset;
-	/* Pages with different versions MAY have different data. */
-	uint16_t version;
+    /* 
+     * [修改] 直接嵌入结构体 
+     * 这里会占用约 1280 字节，网络层必须支持发送这么大的包头 
+     */
+    copyset_t inv_copyset;
+    
+    /* [修改] 升级为 32 位以匹配 kvm_host.h 的定义 */
+    uint32_t version;
+    
 #elif defined(TARDIS_KVM_DSM)
-	uint16_t padding;
+    /* 
+     * Tardis 模式如果不用 copyset，保留 Padding 即可。
+     * 但建议检查 Tardis 逻辑是否也受影响。
+     */
+    uint16_t padding;
 #endif
-	/*
-	 * (Hopefully) unique transcation id, which is used to eliminate the
-	 * necessity of per-socket locks.
-	 */
-	uint16_t txid;
-} tx_add_t;
+
+    /*
+     * (Hopefully) unique transcation id
+     */
+    uint16_t txid;
+
+} __attribute__((packed)) tx_add_t; /* [必须] 强制紧凑对齐 */
 
 struct kvm_dsm_info {
 	unsigned state;
