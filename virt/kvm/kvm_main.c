@@ -3924,9 +3924,19 @@ int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 		goto out_free_3;
 	}
 
+	/* [Frontier] 初始化 DSM Response 专用缓存池 */
+	/* 解决万节点高频交互下的内核内存碎片问题 */
+	dsm_resp_cache = kmem_cache_create("dsm_resp_cache", 
+					   sizeof(struct dsm_response), 
+					   0, SLAB_HWCACHE_ALIGN, NULL);
+	if (!dsm_resp_cache) {
+		r = -ENOMEM;
+		goto out_free_vcpu_cache; /* 跳转到特定的释放点 */
+	}
+
 	r = kvm_async_pf_init();
 	if (r)
-		goto out_free;
+		goto out_free_dsm_cache; /* 跳转到特定的释放点 */
 
 	kvm_chardev_ops.owner = module;
 	kvm_vm_fops.owner = module;
@@ -3961,6 +3971,10 @@ out_unreg:
 	kvm_async_pf_deinit();
 out_free:
 	kmem_cache_destroy(kvm_vcpu_cache);
+out_free_dsm_cache:
+	kmem_cache_destroy(dsm_resp_cache);
+out_free_vcpu_cache:
+	kmem_cache_destroy(kvm_vcpu_cache);
 out_free_3:
 	unregister_reboot_notifier(&kvm_reboot_notifier);
 	cpuhp_remove_state_nocalls(CPUHP_AP_KVM_STARTING);
@@ -3982,6 +3996,11 @@ void kvm_exit(void)
 {
 	debugfs_remove_recursive(kvm_debugfs_dir);
 	misc_deregister(&kvm_dev);
+
+	/* [Frontier] 销毁 DSM 缓存池 (LIFO 原则，先销毁后创建的) */
+	if (dsm_resp_cache)
+		kmem_cache_destroy(dsm_resp_cache);
+
 	kmem_cache_destroy(kvm_vcpu_cache);
 	kvm_async_pf_deinit();
 	unregister_syscore_ops(&kvm_syscore_ops);
