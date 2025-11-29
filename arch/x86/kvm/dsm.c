@@ -139,10 +139,11 @@ int kvm_dsm_add_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
 			new_hvaslot->vfn_dsm_state[i + (vfn - new_hvaslot->base_vfn)].state
 				= hvaslot->vfn_dsm_state[i + (gfn - gfn_iter)].state;
 #ifdef IVY_KVM_DSM
-			memcpy(new_hvaslot->vfn_dsm_state[i + (vfn -
-					new_hvaslot->base_vfn)].copyset,
-					hvaslot->vfn_dsm_state[i + (gfn - gfn_iter)].copyset,
-					sizeof(copyset_t));
+    /* [修改] 使用 bitmap_copy 进行拷贝 */
+    bitmap_copy(new_hvaslot->vfn_dsm_state[i + (vfn - new_hvaslot->base_vfn)].copyset.bits,
+                hvaslot->vfn_dsm_state[i + (gfn - gfn_iter)].copyset.bits,
+                DSM_MAX_INSTANCES);
+
 #elif defined(TARDIS_KVM_DSM)
 			/* TODO */
 #endif
