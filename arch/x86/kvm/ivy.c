@@ -25,61 +25,91 @@
 
 #include <linux/kthread.h>
 #include <linux/mmu_context.h>
+ 
+#include <linux/random.h>
+#include <linux/delay.h>
+#include <linux/nmi.h>
+#include <linux/sched.h>
+#include <linux/watchdog.h>
 
-enum kvm_dsm_request_type {
-	DSM_REQ_INVALIDATE,
-	DSM_REQ_READ,
-	DSM_REQ_WRITE,
-};
+/* 
+ * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
+ * [删除] struct dsm_request ... (已移至 kvm_host.h)
+ * [删除] struct dsm_response ... (已移至 kvm_host.h)
+ */
+
 static char* req_desc[3] = {"INV", "READ", "WRITE"};
 
+/* 
+ * [修改] dsm_get_copyset
+ * 变化：现在 copyset 是结构体，我们需要返回它的地址 (&)，
+ * 否则返回的是整个巨大的结构体副本。
+ */
 static inline copyset_t *dsm_get_copyset(
 		struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	return slot->vfn_dsm_state[vfn - slot->base_vfn].copyset;
+    /* 添加 & 取地址符 */
+	return &slot->vfn_dsm_state[vfn - slot->base_vfn].copyset;
 }
 
+/* [Frontier] 微秒级抖动，打散万节点并发请求 */
+/* 定义一个模块参数，允许运行时修改 */
+static int enable_jitter = 1;
+module_param(enable_jitter, int, 0644);
+
+static inline void inject_jitter(void) {
+    if (!enable_jitter) return; /* 玩游戏时，echo 0 > /sys/module/giantvm_kvm/parameters/enable_jitter */
+    unsigned int delay = prandom_u32() % 10000;
+    ndelay(delay);
+}
+
+/* [修改] 适配结构体 */
 static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn, int id)
 {
-	set_bit(id, slot->vfn_dsm_state[vfn - slot->base_vfn].copyset);
+    copyset_t *cs = dsm_get_copyset(slot, vfn);
+    
+    /* [Frontier 新增] 熔断机制 (可能有逻辑错误，删掉)
+     * 如果一个页面已经被超过 128 个节点共享，拒绝新的节点加入共享集。
+     * 新节点将被迫向 owner 发起单播读取，而不是加入 copyset。
+     * 目的：防止后续发生 Write 时，Owner 需要发送 10000 个 Invalidation 包导致系统卡死。
+     
+    if (bitmap_weight(cs->bits, DSM_MAX_INSTANCES) > 128) {
+        return;
+    } */
+
+    set_bit(id, cs->bits);
 }
 
+/* [修改] 适配结构体 */
 static inline void dsm_clear_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn)
 {
-	bitmap_zero(dsm_get_copyset(slot, vfn), DSM_MAX_INSTANCES);
+    bitmap_zero(dsm_get_copyset(slot, vfn)->bits, DSM_MAX_INSTANCES);
 }
 
-/*
- * @requester:	the requester (real message sender or manager or probOwner) of
- * this invalidate request.
- * @msg_sender: the real message sender.
- */
-struct dsm_request {
-	unsigned char requester;
-	unsigned char msg_sender;
-	gfn_t gfn;
-	unsigned char req_type;
-	bool is_smm;
+/* [添加] 暴力接收：死循环直到读够 data_len 长度 */
+static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
+    int received = 0;
+    int ret = 0;
+    struct kvec iov;
+    struct msghdr msg;
 
-	/*
-	 * If version of two pages in different nodes are the same, the contents
-	 * are the same.
-	 */
-	uint16_t version;
-};
+    while (received < data_len) {
+        iov.iov_base = (char*)data + received;
+        iov.iov_len = data_len - received;
+        
+        memset(&msg, 0, sizeof(msg));
+        /* MSG_WAITALL 在内核中告诉 TCP 栈尽可能多读 */
+        ret = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, MSG_WAITALL);
 
-struct dsm_response {
-	copyset_t inv_copyset;
-	uint16_t version;
-};
+        if (ret <= 0) {
+            return ret; /* 连接断了或者真出错了 */
+        }
+        received += ret;
+    }
+    return received;
+}
 
-/*
- * @msg_sender: the message may be delegated by manager (or other probOwners)
- * (kvm->arch.dsm_id) and real sender can be appointed here.
- * @inv_copyset: if req_type = DSM_REQ_WRITE, the requester becomes owner and has duty
- * to broadcast invalidate.
- * @return: the length of response
- */
+/* 修改 kvm_dsm_fetch */
 static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		const struct dsm_request *req, void *data, struct dsm_response *resp)
 {
@@ -89,9 +119,25 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		.txid = generate_txid(kvm, dest_id),
 	};
 	int retry_cnt = 0;
+    
+    /* [Frontier] 定义上下文标志 */
+    int send_flags = 0;
+    int recv_flags = 0;
+    bool is_atomic = false;
 
 	if (kvm->arch.dsm_stopped)
 		return -EINVAL;
+
+    /* [Frontier] 检测原子上下文 */
+    if (in_atomic() || irqs_disabled()) {
+        is_atomic = true;
+        send_flags = MSG_DONTWAIT; /* 关键：禁止睡眠 */
+        recv_flags = MSG_DONTWAIT;
+    }  else {
+        /* 非原子上下文，保持原作者的习惯 */
+        send_flags = 0; 
+        recv_flags = SOCK_NONBLOCK; 
+    }
 
 	if (!from_server)
 		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
@@ -99,10 +145,10 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		conn_sock = &kvm->arch.dsm_conn_socks[DSM_MAX_INSTANCES + dest_id];
 	}
 
-	/*
-	 * Mutiple vCPUs/servers may connect to a remote node simultaneously.
-	 */
 	if (*conn_sock == NULL) {
+        /* [Frontier] 原子上下文无法获取互斥锁建立连接，必须放弃 */
+        if (is_atomic) return -ENOTCONN;
+
 		mutex_lock(&kvm->arch.conn_init_lock);
 		if (*conn_sock == NULL) {
 			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
@@ -118,20 +164,48 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
 			req->gfn, req->is_smm);
 
+    /* [Frontier] 发送阶段：忙等待保护 */
+retry_send:
 	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
-				dsm_request), 0, &tx_add);
+				dsm_request), send_flags, &tx_add);
+    
+    if (ret == -EAGAIN && is_atomic) {
+        cpu_relax();
+        touch_nmi_watchdog();        /* 防止硬死锁重启 */
+        touch_softlockup_watchdog(); /* [新增] 防止软死锁报错 */
+        goto retry_send;             /* 死磕直到缓冲区有空位 */
+    }
 	if (ret < 0)
 		goto done;
 
 	retry_cnt = 0;
+    
+    /* [Frontier] 接收阶段：忙等待保护 */
 	if (req->req_type == DSM_REQ_INVALIDATE) {
-		ret = network_ops.receive(*conn_sock, data, 0, &tx_add);
+retry_recv_inv:
+		ret = network_ops.receive(*conn_sock, data, recv_flags, &tx_add);
+        if (ret == -EAGAIN && is_atomic) {
+            cpu_relax();
+            touch_nmi_watchdog();
+            touch_softlockup_watchdog(); /* [新增] */
+            goto retry_recv_inv;
+        }
 	}
 	else {
 retry:
 		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
 		if (ret == -EAGAIN) {
 			retry_cnt++;
+            
+            /* [Frontier] 原子上下文死等逻辑 */
+            if (is_atomic) {
+                cpu_relax();
+                touch_nmi_watchdog();
+                touch_softlockup_watchdog(); /* [新增] */
+                goto retry;
+            }
+
+            /* 原有逻辑：普通上下文超时检测 */
 			if (retry_cnt > 100000) {
 				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
 						"kvm %d for too LONG",
@@ -152,25 +226,31 @@ done:
 
 /*
  * kvm_dsm_invalidate - issued by owner of a page to invalidate all of its copies
- * @cpyset: given copyset. NULL means using its own copyset.
+ * [Frontier Modified] 使用安全循环防止万节点死锁
  */
 static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
-		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req)
+		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req_id)
 {
 	int holder;
 	int ret = 0;
-	char r = 1;
+	char r = 1; /* Dummy buffer for ACK */
 	copyset_t *copyset;
-	struct dsm_response resp;
+	struct dsm_response resp; /* Placeholder, not used for invalidate */
+    
+    /* 循环计数器，用于 watchdog */
+    int loop_cnt = 0;
 
 	copyset = cpyset ? cpyset : dsm_get_copyset(slot, vfn);
 
-	/*
-	 * A given copyset has been properly tailored so that no redundant INVs will
-	 * be sent to invalid nodes (nodes in the call-chain).
-	 */
-	for_each_set_bit(holder, copyset, DSM_MAX_INSTANCES) {
-		struct dsm_request req = {
+    /* 
+     * [Frontier 修正] 
+     * 1. 使用 touch_softlockup_watchdog 防止内核报 "CPU stuck" 
+     * 2. 只有在确实安全的时候才调度
+     */
+	for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
+		
+        /* 构造请求结构体 */
+        struct dsm_request req = {
 			.req_type = DSM_REQ_INVALIDATE,
 			.requester = kvm->arch.dsm_id,
 			.msg_sender = kvm->arch.dsm_id,
@@ -178,14 +258,40 @@ static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
 			.is_smm = is_smm,
 			.version = dsm_get_version(slot, vfn),
 		};
+        
 		if (kvm->arch.dsm_id == holder)
 			continue;
-		/* Santiy check on copyset consistency. */
+        
+		/* Sanity check on copyset consistency. */
 		BUG_ON(holder >= kvm->arch.cluster_iplist_len);
 
+        /* 
+         * [Frontier] 调用改造后的 kvm_dsm_fetch 
+         * 此时它内部会自动使用 MSG_DONTWAIT，并在缓冲区满时 cpu_relax()
+         */
 		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
 		if (ret < 0)
 			return ret;
+
+        /* 每发送 64 个包检查一次状态 */
+        if (++loop_cnt % 64 == 0) { 
+            
+            /* [关键新增 1] 同时喂 NMI 狗和 Softlockup 狗 */
+            touch_nmi_watchdog();        // 防止硬死锁检测重启
+            touch_softlockup_watchdog(); // [必须加] 防止软死锁检测报错
+            
+            /* [关键新增 2] 严格的上下文检查 */
+            /* 如果我们在中断上下文、持有自旋锁或禁止抢占状态，绝对不能调度 */
+            if (!in_atomic() && !irqs_disabled()) {
+                cond_resched();
+            } else {
+                /* 
+                 * 如果持有自旋锁 (Spinlock Held)，我们不能释放 CPU，
+                 * 只能通过 cpu_relax() 通知 CPU 流水线歇口气。
+                 */
+                cpu_relax(); 
+            }
+        }
 	}
 
 	return 0;
@@ -241,85 +347,78 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
 		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
 		tx_add_t *tx_add)
 {
-	int ret = 0, length = 0;
-	int owner = -1;
+    int ret = 0, length = 0;
+    int owner = -1;
+    bool is_owner = false;
+    
+    /* [Frontier] 改为指针，从专用 Slab Cache 分配 */
+    struct dsm_response *resp;
+    resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
+    if (!resp) return -ENOMEM;
 
-	bool is_owner = false;
-	struct dsm_response resp;
+    /* [Frontier] 插入抖动，防止拥塞 */
+    inject_jitter();
 
-	if (dsm_is_pinned(slot, vfn) && !kvm->arch.dsm_stopped) {
-		*retry = true;
-		dsm_debug("kvm[%d] REQ_WRITE blocked by pinned gfn[%llu,%d], sleep then retry\n",
-				kvm->arch.dsm_id, req->gfn, req->is_smm);
-		return 0;
-	}
+    if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
+        *retry = true;
+        goto out_free; 
+    }
 
-	if ((is_owner = dsm_is_owner(slot, vfn))) {
-		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
+    if ((is_owner = dsm_is_owner(slot, vfn))) {
+        BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
+        dsm_change_state(slot, vfn, DSM_INVALID);
+        kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
+        
+        /* 使用 memcpy 操作结构体 */
+        memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
+        resp->version = dsm_get_version(slot, vfn);
+        
+        clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
+        
+        ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
+        if (ret < 0) goto out_free;
+    }
+    else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
+        bitmap_zero(resp->inv_copyset.bits, DSM_MAX_INSTANCES);
+        resp->version = dsm_get_version(slot, vfn);
+        ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
+        if (ret < 0) goto out_free;
+        dsm_set_prob_owner(slot, vfn, req->msg_sender);
+        dsm_change_state(slot, vfn, DSM_INVALID);
+    }
+    else {
+        struct dsm_request new_req = {
+            .req_type = DSM_REQ_WRITE,
+            .requester = kvm->arch.dsm_id,
+            .msg_sender = req->msg_sender,
+            .gfn = req->gfn,
+            .is_smm = req->is_smm,
+            .version = req->version,
+        };
+        owner = dsm_get_prob_owner(slot, vfn);
+        /* 传入指针 */
+        ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
+        if (ret < 0) goto out_free;
 
-		/* I'm owner */
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](M1) changed owner of gfn[%llu,%d] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, kvm->arch.dsm_id, req->msg_sender);
-		dsm_change_state(slot, vfn, DSM_INVALID);
-		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
-		/* Send back copyset to new owner. */
-		resp.inv_copyset = *dsm_get_copyset(slot, vfn);
-		resp.version = dsm_get_version(slot, vfn);
-		clear_bit(kvm->arch.dsm_id, &resp.inv_copyset);
-		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			return ret;
-	}
-	else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
-		/* Send back a dummy copyset. */
-		resp.inv_copyset = 0;
-		resp.version = dsm_get_version(slot, vfn);
-		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			return ret;
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_change_state(slot, vfn, DSM_INVALID);
-	}
-	else {
-		struct dsm_request new_req = {
-			.req_type = DSM_REQ_WRITE,
-			.requester = kvm->arch.dsm_id,
-			.msg_sender = req->msg_sender,
-			.gfn = req->gfn,
-			.is_smm = req->is_smm,
-			.version = req->version,
-		};
-		owner = dsm_get_prob_owner(slot, vfn);
-		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
-		if (ret < 0)
-			return ret;
+        dsm_change_state(slot, vfn, DSM_INVALID);
+        kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
+        dsm_set_prob_owner(slot, vfn, req->msg_sender);
+        
+        clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
+    }
 
-		dsm_change_state(slot, vfn, DSM_INVALID);
-		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](M3) changed owner of gfn[%llu,%d] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, owner, req->msg_sender);
+    if (is_owner) {
+        length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
+    }
 
-		clear_bit(kvm->arch.dsm_id, &resp.inv_copyset);
-	}
+    tx_add->inv_copyset = resp->inv_copyset;
+    tx_add->version = resp->version;
+    ret = network_ops.send(conn_sock, page, length, 0, tx_add);
 
-	if (is_owner) {
-		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot,
-				req->gfn, req->version);
-	}
-
-	tx_add->inv_copyset = resp.inv_copyset;
-	tx_add->version = resp.version;
-	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
-	if (ret < 0)
-		return ret;
-	dsm_debug_v("kvm[%d] sent page[%llu,%d] to kvm[%d] length %d hash: 0x%x\n",
-			kvm->arch.dsm_id, req->gfn, req->is_smm, req->requester, length,
-			jhash(page, length, JHASH_INITVAL));
-	return 0;
+out_free:
+    /* [Frontier] 归还内存到 Cache */
+    kmem_cache_free(dsm_resp_cache, resp);
+    return ret;
 }
 
 /*
@@ -347,49 +446,52 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 	int ret = 0, length = 0;
 	int owner = -1;
 	bool is_owner = false;
-	struct dsm_response resp = {
-		.version = 0,
-	};
+	
+	/* [Frontier] 1. 改为指针 */
+	struct dsm_response *resp;
+
+	/* [Frontier] 2. 从专用 Slab Cache 分配 */
+	resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
+	if (!resp) return -ENOMEM;
+
+    /* [Frontier] 3. 注入微抖动 (可选，与 Write 保持一致) */
+    inject_jitter();
+
+	resp->version = 0;
 
 	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
 		*retry = true;
-		dsm_debug("kvm[%d] REQ_READ blocked by pinned gfn[%llu,%d], sleep then retry\n",
-				kvm->arch.dsm_id, req->gfn, req->is_smm);
-		return 0;
+		ret = 0;
+		goto out_free; /* 必须跳转释放 */
 	}
 
 	if ((is_owner = dsm_is_owner(slot, vfn))) {
 		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
-
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](S1) changed owner of gfn[%llu,%d] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, kvm->arch.dsm_id, req->msg_sender);
-		/* TODO: if modified */
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
 
 		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			goto out;
-		/*
-		 * read fault causes owner transmission, too. Send copyset back to new
-		 * owner.
-		 */
-		resp.inv_copyset = *dsm_get_copyset(slot, vfn);
-		BUG_ON(!(test_bit(kvm->arch.dsm_id, &resp.inv_copyset)));
-		resp.version = dsm_get_version(slot, vfn);
+		if (ret < 0) goto out_free;
+
+        /* [修改] memcpy 复制结构体 */
+		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
+        
+        /* [修改] 指针操作检查 */
+		BUG_ON(!(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
+		resp->version = dsm_get_version(slot, vfn);
 	}
 	else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
 		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0)
-			goto out;
+		if (ret < 0) goto out_free;
 
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
 		dsm_change_state(slot, vfn, DSM_SHARED);
 		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
-		resp.inv_copyset = *dsm_get_copyset(slot, vfn);
-		resp.version = dsm_get_version(slot, vfn);
+		
+        /* [修改] memcpy */
+		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
+		resp->version = dsm_get_version(slot, vfn);
 	}
 	else {
 		struct dsm_request new_req = {
@@ -401,33 +503,28 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 			.version = req->version,
 		};
 		owner = dsm_get_prob_owner(slot, vfn);
-		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, &resp);
-		if (ret < 0)
-			goto out;
-		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id,
-						&resp.inv_copyset)));
-		/* Even read fault changes owner now. May the force be with you. */
+		
+        /* [修改] 传入 resp 指针 */
+		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
+		if (ret < 0) goto out_free;
+		
+        /* [修改] bits 操作 */
+		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
 		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_debug_v("kvm[%d](S3) changed owner of gfn[%llu,%d] vfn[%llu] "
-				"from kvm[%d] to kvm[%d]\n", kvm->arch.dsm_id, req->gfn,
-				req->is_smm, vfn, owner, req->msg_sender);
 	}
 
 	if (is_owner) {
-		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot,
-				req->gfn, req->version);
+		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
 	}
 
-	tx_add->inv_copyset = resp.inv_copyset;
-	tx_add->version = resp.version;
+	tx_add->inv_copyset = resp->inv_copyset;
+	tx_add->version = resp->version;
+	
 	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
-	if (ret < 0)
-		goto out;
-	dsm_debug_v("kvm[%d] sent page[%llu,%d] to kvm[%d] length %d hash: 0x%x\n",
-			kvm->arch.dsm_id, req->gfn, req->is_smm, req->requester, length,
-			jhash(page, length, JHASH_INITVAL));
 
-out:
+out_free:
+    /* [Frontier] 4. 释放回 Cache */
+	kmem_cache_free(dsm_resp_cache, resp);
 	return ret;
 }
 
