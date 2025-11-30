@@ -31,6 +31,8 @@
 #include <linux/nmi.h>
 #include <linux/sched.h>
 #include <linux/watchdog.h>
+#include <linux/percpu.h>
+#include <linux/preempt.h>
 
 /* 
  * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
@@ -39,6 +41,9 @@
  */
 
 static char* req_desc[3] = {"INV", "READ", "WRITE"};
+
+/* [添加] 定义 Per-CPU 发送缓冲区，专供原子上下文使用，防止 OOM */
+static DEFINE_PER_CPU(tx_add_t, atomic_tx_buffer);
 
 /* 
  * [修改] dsm_get_copyset
@@ -109,43 +114,63 @@ static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
     return received;
 }
 
-/* 修改 kvm_dsm_fetch */
+/* 修改后的 kvm_dsm_fetch：混合内存分配策略 + 死锁防护 */
 static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		const struct dsm_request *req, void *data, struct dsm_response *resp)
 {
 	kconnection_t **conn_sock;
 	int ret;
-	
-    /* [Modification] Use pointer instead of stack variable */
     tx_add_t *tx_add; 
-    
 	int retry_cnt = 0;
     int send_flags = 0;
     int recv_flags = 0;
     bool is_atomic = false;
+    bool use_percpu_buffer = false;
 
-    /* [Modification] Dynamic allocation to save stack space */
-    /* GFP_ATOMIC is mandatory because we might be in spinlock context */
-    tx_add = kzalloc(sizeof(tx_add_t), GFP_ATOMIC);
-    if (!tx_add) {
-        return -ENOMEM;
+    /* 
+     * [Frontier Fix] 混合分配策略 (Hybrid Allocation Strategy)
+     * 解决万节点下 tx_add (1280字节) 原子分配失败导致的崩溃问题。
+     */
+    if (in_atomic() || irqs_disabled()) {
+        /* 
+         * 场景 A: 原子上下文 (Spinlock held / IRQ disabled)
+         * 1. 绝对不能睡眠，不能用 GFP_KERNEL。
+         * 2. GFP_ATOMIC 在高负载下极易失败。
+         * 3. 因禁止抢占，使用 Per-CPU Buffer 是安全的。
+         */
+        is_atomic = true;
+        send_flags = MSG_DONTWAIT; 
+        recv_flags = MSG_DONTWAIT;
+        
+        /* 获取本 CPU 的专用静态 buffer */
+        tx_add = this_cpu_ptr(&atomic_tx_buffer);
+        /* 必须清零，因为它是复用的 */
+        memset(tx_add, 0, sizeof(tx_add_t));
+        use_percpu_buffer = true;
+        
+    }  else {
+        /* 
+         * 场景 B: 进程上下文 (Mutex held / Preemptible)
+         * 1. 可能发生调度，不能用 Per-CPU Buffer (数据会被覆盖)。
+         * 2. 允许睡眠，使用 GFP_KERNEL 等待内存回收，几乎不失败。
+         */
+        is_atomic = false;
+        send_flags = 0; 
+        recv_flags = SOCK_NONBLOCK; 
+        
+        tx_add = kzalloc(sizeof(tx_add_t), GFP_KERNEL);
+        if (!tx_add) {
+            printk(KERN_ERR "kvm-dsm: Critical memory exhaustion in fetch\n");
+            return -ENOMEM;
+        }
+        use_percpu_buffer = false;
     }
 
 	tx_add->txid = generate_txid(kvm, dest_id);
 
 	if (kvm->arch.dsm_stopped) {
-        kfree(tx_add);
+        if (!use_percpu_buffer) kfree(tx_add);
 		return -EINVAL;
-    }
-
-    /* Check context */
-    if (in_atomic() || irqs_disabled()) {
-        is_atomic = true;
-        send_flags = MSG_DONTWAIT; 
-        recv_flags = MSG_DONTWAIT;
-    }  else {
-        send_flags = 0; 
-        recv_flags = SOCK_NONBLOCK; 
     }
 
 	if (!from_server)
@@ -155,9 +180,9 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	}
 
 	if (*conn_sock == NULL) {
-        /* In atomic context we cannot sleep to wait for mutex */
+        /* 在原子上下文中无法睡眠等待连接建立，必须返回错误 */
         if (is_atomic) {
-            kfree(tx_add);
+            if (!use_percpu_buffer) kfree(tx_add);
             return -ENOTCONN;
         }
 
@@ -166,7 +191,7 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
 			if (ret < 0) {
 				mutex_unlock(&kvm->arch.conn_init_lock);
-                kfree(tx_add);
+                if (!use_percpu_buffer) kfree(tx_add);
 				return ret;
 			}
 		}
@@ -178,15 +203,15 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 			req->gfn, req->is_smm);
 
 retry_send:
-    /* [Modification] Pass pointer tx_add */
+    /* 传递 tx_add 指针 */
 	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
 				dsm_request), send_flags, tx_add);
     
     if (ret == -EAGAIN && is_atomic) {
-        /* [Modification] Deadlock prevention */
+        /* [Modification] 防止网络拥塞导致的 CPU 死锁 */
         if (++retry_cnt > 1000000) {
             printk_ratelimited(KERN_ERR "kvm-dsm: Atomic send deadlock to node %d detected.\n", dest_id);
-            kfree(tx_add);
+            if (!use_percpu_buffer) kfree(tx_add);
             return -ETIMEDOUT;
         }
         cpu_relax();
@@ -203,10 +228,10 @@ retry_send:
 retry_recv_inv:
 		ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
         if (ret == -EAGAIN && is_atomic) {
-            /* [Modification] Deadlock prevention */
+            /* [Modification] 接收死锁防护 */
             if (++retry_cnt > 1000000) {
                 printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv_inv deadlock from node %d detected.\n", dest_id);
-                kfree(tx_add);
+                if (!use_percpu_buffer) kfree(tx_add);
                 return -ETIMEDOUT;
             }
             cpu_relax();
@@ -222,10 +247,10 @@ retry:
 			retry_cnt++;
             
             if (is_atomic) {
-                /* [Modification] Deadlock prevention */
+                /* [Modification] 原子上下文接收死锁防护 */
                 if (retry_cnt > 1000000) {
                     printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv deadlock from node %d detected.\n", dest_id);
-                    kfree(tx_add);
+                    if (!use_percpu_buffer) kfree(tx_add);
                     return -ETIMEDOUT;
                 }
                 cpu_relax();
@@ -234,16 +259,18 @@ retry:
                 goto retry;
             }
 
-            /* Original timeout logic for non-atomic context */
+            /* 普通进程上下文的超时逻辑 */
 			if (retry_cnt > 100000) {
 				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
 						"kvm %d for too LONG",
 						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
 				retry_cnt = 0;
+                /* 这里可以选择 cond_resched() 让出 CPU */
+                cond_resched();
 			}
 			goto retry;
 		}
-        /* [Modification] Access via pointer */
+        /* [Modification] 通过指针访问数据 */
 		resp->inv_copyset = tx_add->inv_copyset;
 		resp->version = tx_add->version;
 	}
@@ -251,8 +278,10 @@ retry:
 		goto done;
 
 done:
-    /* [Modification] Free memory before exit */
-    kfree(tx_add);
+    /* [Modification] 只有在使用动态分配的内存时才释放 */
+    if (!use_percpu_buffer) {
+        kfree(tx_add);
+    }
 	return ret;
 }
 
