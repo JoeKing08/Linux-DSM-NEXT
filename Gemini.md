@@ -895,10 +895,10 @@ static int connect_node_impl(const char *ip) {
     setsockopt(s, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
     /* 2. 基础性能优化 */
-    int flag = 1, bufsize = 4 * 1024 * 1024;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(int));
+    //int flag = 1, bufsize = 4 * 1024 * 1024;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int)); //这个别删
+    //setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(int));
+    //setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(int));
 
     /* 3. KeepAlive (防止静默断开) */
     int keepalive = 1, keepidle = 5, keepintvl = 2, keepcnt = 3;
@@ -1309,10 +1309,6 @@ int main() {
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
     
-    //int bufsize = 4 * 1024 * 1024;
-    //setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-    //setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
@@ -1454,8 +1450,9 @@ net.ipv4.tcp_max_orphans = 262144
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_mem = 4194304 6291456 8388608
-net.ipv4.tcp_wmem = 4096 16384 4194304
-net.ipv4.tcp_rmem = 4096 87380 6291456
+net.ipv4.tcp_wmem = 4096 131072 4194304
+net.ipv4.tcp_rmem = 4096 131072 6291456
+net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_max_syn_backlog = 65536
 net.core.netdev_max_backlog = 65536
 echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
@@ -1484,6 +1481,8 @@ EOF
     ```bash
     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
     sudo ifconfig eth0 mtu 9000
+    # 为 GFP_ATOMIC 预留 1GB 内存 (针对 128GB+ 内存的宿主机)
+    echo "vm.min_free_kbytes = 1048576" | sudo tee -a /etc/sysctl.conf
     ```
 
 2.  **关闭 NMI Watchdog：**
