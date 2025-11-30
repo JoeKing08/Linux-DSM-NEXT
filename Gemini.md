@@ -136,17 +136,20 @@ typedef struct tx_add {
 #include "kvm_host.h" 
 #include <linux/random.h>
 #include <linux/delay.h>
-#include <linux/sched.h>
 #include <linux/nmi.h>
 #include <linux/sched.h>
 #include <linux/watchdog.h>
-#include <linux/delay.h>
+#include <linux/percpu.h>
+#include <linux/preempt.h>
 
 /* 
  * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
  * [删除] struct dsm_request ... (已移至 kvm_host.h)
  * [删除] struct dsm_response ... (已移至 kvm_host.h)
  */
+
+/* [添加] 定义 Per-CPU 发送缓冲区，专供原子上下文使用，防止 OOM */
+static DEFINE_PER_CPU(tx_add_t, atomic_tx_buffer);
 
 /* [保留] 这个是本地调试用的描述符，不用移 */
 static char* req_desc[3] = {"INV", "READ", "WRITE"};
@@ -220,34 +223,63 @@ static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
     return received;
 }
 
-/* 修改 kvm_dsm_fetch */
+/* 修改后的 kvm_dsm_fetch：混合内存分配策略 + 死锁防护 */
 static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		const struct dsm_request *req, void *data, struct dsm_response *resp)
 {
 	kconnection_t **conn_sock;
 	int ret;
-	tx_add_t tx_add = {
-		.txid = generate_txid(kvm, dest_id),
-	};
+    tx_add_t *tx_add; 
 	int retry_cnt = 0;
-    
-    /* [Frontier] 定义上下文标志 */
     int send_flags = 0;
     int recv_flags = 0;
     bool is_atomic = false;
+    bool use_percpu_buffer = false;
 
-	if (kvm->arch.dsm_stopped)
-		return -EINVAL;
-
-    /* [Frontier] 检测原子上下文 */
+    /* 
+     * [Frontier Fix] 混合分配策略 (Hybrid Allocation Strategy)
+     * 解决万节点下 tx_add (1280字节) 原子分配失败导致的崩溃问题。
+     */
     if (in_atomic() || irqs_disabled()) {
+        /* 
+         * 场景 A: 原子上下文 (Spinlock held / IRQ disabled)
+         * 1. 绝对不能睡眠，不能用 GFP_KERNEL。
+         * 2. GFP_ATOMIC 在高负载下极易失败。
+         * 3. 因禁止抢占，使用 Per-CPU Buffer 是安全的。
+         */
         is_atomic = true;
-        send_flags = MSG_DONTWAIT; /* 关键：禁止睡眠 */
+        send_flags = MSG_DONTWAIT; 
         recv_flags = MSG_DONTWAIT;
+        
+        /* 获取本 CPU 的专用静态 buffer */
+        tx_add = this_cpu_ptr(&atomic_tx_buffer);
+        /* 必须清零，因为它是复用的 */
+        memset(tx_add, 0, sizeof(tx_add_t));
+        use_percpu_buffer = true;
+        
     }  else {
-        /* 非原子上下文，保持原作者的习惯 */
+        /* 
+         * 场景 B: 进程上下文 (Mutex held / Preemptible)
+         * 1. 可能发生调度，不能用 Per-CPU Buffer (数据会被覆盖)。
+         * 2. 允许睡眠，使用 GFP_KERNEL 等待内存回收，几乎不失败。
+         */
+        is_atomic = false;
         send_flags = 0; 
         recv_flags = SOCK_NONBLOCK; 
+        
+        tx_add = kzalloc(sizeof(tx_add_t), GFP_KERNEL);
+        if (!tx_add) {
+            printk(KERN_ERR "kvm-dsm: Critical memory exhaustion in fetch\n");
+            return -ENOMEM;
+        }
+        use_percpu_buffer = false;
+    }
+
+	tx_add->txid = generate_txid(kvm, dest_id);
+
+	if (kvm->arch.dsm_stopped) {
+        if (!use_percpu_buffer) kfree(tx_add);
+		return -EINVAL;
     }
 
 	if (!from_server)
@@ -257,14 +289,18 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	}
 
 	if (*conn_sock == NULL) {
-        /* [Frontier] 原子上下文无法获取互斥锁建立连接，必须放弃 */
-        if (is_atomic) return -ENOTCONN;
+        /* 在原子上下文中无法睡眠等待连接建立，必须返回错误 */
+        if (is_atomic) {
+            if (!use_percpu_buffer) kfree(tx_add);
+            return -ENOTCONN;
+        }
 
 		mutex_lock(&kvm->arch.conn_init_lock);
 		if (*conn_sock == NULL) {
 			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
 			if (ret < 0) {
 				mutex_unlock(&kvm->arch.conn_init_lock);
+                if (!use_percpu_buffer) kfree(tx_add);
 				return ret;
 			}
 		}
@@ -272,66 +308,89 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	}
 
 	dsm_debug_v("kvm[%d] sent request[0x%x] to kvm[%d] req_type[%s] gfn[%llu,%d]",
-			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
+			kvm->arch.dsm_id, tx_add->txid, dest_id, req_desc[req->req_type],
 			req->gfn, req->is_smm);
 
-    /* [Frontier] 发送阶段：忙等待保护 */
 retry_send:
+    /* 传递 tx_add 指针 */
 	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
-				dsm_request), send_flags, &tx_add);
+				dsm_request), send_flags, tx_add);
     
     if (ret == -EAGAIN && is_atomic) {
+        /* [Modification] 防止网络拥塞导致的 CPU 死锁 */
+        if (++retry_cnt > 1000000) {
+            printk_ratelimited(KERN_ERR "kvm-dsm: Atomic send deadlock to node %d detected.\n", dest_id);
+            if (!use_percpu_buffer) kfree(tx_add);
+            return -ETIMEDOUT;
+        }
         cpu_relax();
-        touch_nmi_watchdog();        /* 防止硬死锁重启 */
-        touch_softlockup_watchdog(); /* [新增] 防止软死锁报错 */
-        goto retry_send;             /* 死磕直到缓冲区有空位 */
+        touch_nmi_watchdog();
+        touch_softlockup_watchdog();
+        goto retry_send;
     }
 	if (ret < 0)
 		goto done;
 
 	retry_cnt = 0;
     
-    /* [Frontier] 接收阶段：忙等待保护 */
 	if (req->req_type == DSM_REQ_INVALIDATE) {
 retry_recv_inv:
-		ret = network_ops.receive(*conn_sock, data, recv_flags, &tx_add);
+		ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
         if (ret == -EAGAIN && is_atomic) {
+            /* [Modification] 接收死锁防护 */
+            if (++retry_cnt > 1000000) {
+                printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv_inv deadlock from node %d detected.\n", dest_id);
+                if (!use_percpu_buffer) kfree(tx_add);
+                return -ETIMEDOUT;
+            }
             cpu_relax();
             touch_nmi_watchdog();
-            touch_softlockup_watchdog(); /* [新增] */
+            touch_softlockup_watchdog();
             goto retry_recv_inv;
         }
 	}
 	else {
 retry:
-		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
+		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, tx_add);
 		if (ret == -EAGAIN) {
 			retry_cnt++;
             
-            /* [Frontier] 原子上下文死等逻辑 */
             if (is_atomic) {
+                /* [Modification] 原子上下文接收死锁防护 */
+                if (retry_cnt > 1000000) {
+                    printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv deadlock from node %d detected.\n", dest_id);
+                    if (!use_percpu_buffer) kfree(tx_add);
+                    return -ETIMEDOUT;
+                }
                 cpu_relax();
                 touch_nmi_watchdog();
-                touch_softlockup_watchdog(); /* [新增] */
+                touch_softlockup_watchdog();
                 goto retry;
             }
 
-            /* 原有逻辑：普通上下文超时检测 */
+            /* 普通进程上下文的超时逻辑 */
 			if (retry_cnt > 100000) {
 				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
 						"kvm %d for too LONG",
 						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
 				retry_cnt = 0;
+                /* 这里可以选择 cond_resched() 让出 CPU */
+                cond_resched();
 			}
 			goto retry;
 		}
-		resp->inv_copyset = tx_add.inv_copyset;
-		resp->version = tx_add.version;
+        /* [Modification] 通过指针访问数据 */
+		resp->inv_copyset = tx_add->inv_copyset;
+		resp->version = tx_add->version;
 	}
 	if (ret < 0)
 		goto done;
 
 done:
+    /* [Modification] 只有在使用动态分配的内存时才释放 */
+    if (!use_percpu_buffer) {
+        kfree(tx_add);
+    }
 	return ret;
 }
 ```
@@ -736,7 +795,7 @@ EXPORT_SYMBOL_GPL(kvm_exit);
 *工作目录：`qemu/`*
 
 ### 2.1 修复 Select 限制崩溃
-**文件：** `hw/tpm/tpm_tis.c`
+**文件：** `hw/tpm/tpm_util.c`
 
 **[原代码 / Original]**
 ```c
@@ -804,7 +863,7 @@ void dsm_universal_register(void *ptr, size_t size);
 #define PREFETCH 32           // 预取页面数量 (32 * 4KB = 128KB)
 #define PAGE_SIZE 4096
 #define MAX_OPEN_SOCKETS 10240 // 允许同时保持的最大连接数
-#define WORKER_THREADS 64     // UFFD 处理线程数
+#define WORKER_THREADS 128     // UFFD 处理线程数
 
 // 节点 IP 列表 (请按实际情况填写)
 const char *NODE_IPS[] = { 
@@ -959,27 +1018,65 @@ void *dsm_worker(void *arg) {
                 usleep(1000 * retry_cnt); 
             }
             
-            /* 3. [CRITICAL FIX] 兜底逻辑：防止死锁 */
+            /* 3. [CRITICAL FIX] 体验优先的权衡方案：短时间等待 + 快速降级 */
             if (sock < 0) {
-                fprintf(stderr, "[DSM] FATAL: Node %d unreachable after retries. Zero-filling %lx to unblock vCPU.\n", owner, base);
-                
-                // 必须填充一个零页，否则 vCPU 会永远停在这一行汇编指令上等待
-                struct uffdio_zeropage z = { 
-                    .range = { .start = base, .len = 4096 }, 
-                    .mode = 0 
-                };
-                if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z) < 0) {
-                    // 如果页面已存在(EEXIST)，唤醒即可
-                    if (errno == EEXIST) {
-                         struct uffdio_wake w = { .start = base, .len = 4096, .mode = 0 };
-                         ioctl(uffd_fd, UFFDIO_WAKE, &w);
-                    } else {
-                        perror("[DSM] Emergency zeropage failed");
+                /*
+                 * 无法立即连接。我们进行短暂的、带超时的重试。
+                 * 这个策略旨在优先保证流畅体验，快速从网络抖动中恢复，
+                 * 同时在发生更严重的网络问题时，能迅速降级为零页填充，避免长时间卡死。
+                 */
+                const int STALL_TIMEOUT_MS = 500;  // 设置500毫秒的等待超时，以优先保证体验
+                const int RETRY_INTERVAL_MS = 50;  // 每50毫秒重试一次，更频繁地检查恢复状态
+                int total_wait_ms = 0;
+                bool connected = false;
+
+                // 打印一条信息日志，而不是致命错误，表明系统正在尝试恢复
+                fprintf(stderr, "[DSM] INFO: Node %d unreachable. Stalling for up to %dms on %lx...\n", 
+                        owner, STALL_TIMEOUT_MS, base);
+
+                // 在超时时间内循环尝试重连
+                while (total_wait_ms < STALL_TIMEOUT_MS) {
+                    usleep(RETRY_INTERVAL_MS * 1000);
+                    total_wait_ms += RETRY_INTERVAL_MS;
+
+                    sock = get_or_connect_locked(owner);
+                    if (sock >= 0) {
+                        connected = true;
+                        fprintf(stderr, "[DSM] INFO: Connection to node %d restored after %dms.\n", owner, total_wait_ms);
+                        break; // 连接成功，跳出等待循环
                     }
                 }
+
+                // 如果超时后依然无法连接
+                if (!connected) {
+                    /*
+                     * 等待超时后，我们判定这是一个持续性故障。
+                     * 为了保证VM不被永久冻结，执行最终的降级策略：填充零页。
+                     * 这样可以立即恢复VM的响应，代价是当前缺页的数据会出错。
+                     */
+                    fprintf(stderr, "[DSM] WARN: Node %d unreachable after %dms. Zero-filling %lx to unblock vCPU.\n", 
+                            owner, STALL_TIMEOUT_MS, base);
+                    
+                    struct uffdio_zeropage z = { 
+                        .range = { .start = base, .len = 4096 }, 
+                        .mode = 0 
+                    };
+
+                    if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z) < 0) {
+                        // 竞争条件下，页面可能已经被别的线程或操作填充，这没关系
+                        if (errno == EEXIST) {
+                             struct uffdio_wake w = { .range = { .start = base, .len = 4096 }};
+                             ioctl(uffd_fd, UFFDIO_WAKE, &w);
+                        } else {
+                            perror("[DSM] Emergency zeropage failed");
+                        }
+                    }
+                    
+                    // 既然已经处理（或放弃）了这个缺页事件，就继续处理下一个事件
+                    continue; 
+                }
                 
-                // 跳过后续网络操作，处理下一个事件
-                continue; 
+                /* 如果代码执行到这里，说明在500毫秒内连接成功了，sock已经是有效值，后续的网络收发逻辑会正常执行 */
             }
 
             /* 4. 发送请求 */
@@ -1113,9 +1210,16 @@ void dsm_universal_register(void *ptr, size_t size) {
 
 1.  **文件 `vl.c` (Main Loop):**
     *   在文件头添加：`#include "dsm_backend.h"`
-    *   在 `main` 函数中，找到 `start_io_router();`（或类似的 QEMU 初始化后期），在其**之前**插入：
+    *   在 `main` 函数中，找到找到如下部分：
         ```c
-        dsm_universal_init();
+            configure_accelerator(current_machine)
+
+            /* 插入位置 */
+            dsm_universal_init(); 
+
+            if (qtest_chrdev) {
+                qtest_init(qtest_chrdev, qtest_log, &error_fatal);
+            }
         ```
 
 2.  **文件 `exec.c` (Memory Handling):**
@@ -1376,9 +1480,10 @@ EOF
 
 **步骤 1：L0 环境准备**
 1.  **物理机端口扩容：**
-    在 L0 物理机上，必须扩大端口范围，否则无法支撑全连接：
+    在 L0 物理机上，必须扩大端口范围，同时设置巨型帧：
     ```bash
     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+    sudo ifconfig eth0 mtu 9000
     ```
 
 2.  **关闭 NMI Watchdog：**
