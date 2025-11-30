@@ -115,26 +115,35 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 {
 	kconnection_t **conn_sock;
 	int ret;
-	tx_add_t tx_add = {
-		.txid = generate_txid(kvm, dest_id),
-	};
-	int retry_cnt = 0;
+	
+    /* [Modification] Use pointer instead of stack variable */
+    tx_add_t *tx_add; 
     
-    /* [Frontier] 定义上下文标志 */
+	int retry_cnt = 0;
     int send_flags = 0;
     int recv_flags = 0;
     bool is_atomic = false;
 
-	if (kvm->arch.dsm_stopped)
-		return -EINVAL;
+    /* [Modification] Dynamic allocation to save stack space */
+    /* GFP_ATOMIC is mandatory because we might be in spinlock context */
+    tx_add = kzalloc(sizeof(tx_add_t), GFP_ATOMIC);
+    if (!tx_add) {
+        return -ENOMEM;
+    }
 
-    /* [Frontier] 检测原子上下文 */
+	tx_add->txid = generate_txid(kvm, dest_id);
+
+	if (kvm->arch.dsm_stopped) {
+        kfree(tx_add);
+		return -EINVAL;
+    }
+
+    /* Check context */
     if (in_atomic() || irqs_disabled()) {
         is_atomic = true;
-        send_flags = MSG_DONTWAIT; /* 关键：禁止睡眠 */
+        send_flags = MSG_DONTWAIT; 
         recv_flags = MSG_DONTWAIT;
     }  else {
-        /* 非原子上下文，保持原作者的习惯 */
         send_flags = 0; 
         recv_flags = SOCK_NONBLOCK; 
     }
@@ -146,14 +155,18 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	}
 
 	if (*conn_sock == NULL) {
-        /* [Frontier] 原子上下文无法获取互斥锁建立连接，必须放弃 */
-        if (is_atomic) return -ENOTCONN;
+        /* In atomic context we cannot sleep to wait for mutex */
+        if (is_atomic) {
+            kfree(tx_add);
+            return -ENOTCONN;
+        }
 
 		mutex_lock(&kvm->arch.conn_init_lock);
 		if (*conn_sock == NULL) {
 			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
 			if (ret < 0) {
 				mutex_unlock(&kvm->arch.conn_init_lock);
+                kfree(tx_add);
 				return ret;
 			}
 		}
@@ -161,51 +174,67 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 	}
 
 	dsm_debug_v("kvm[%d] sent request[0x%x] to kvm[%d] req_type[%s] gfn[%llu,%d]",
-			kvm->arch.dsm_id, tx_add.txid, dest_id, req_desc[req->req_type],
+			kvm->arch.dsm_id, tx_add->txid, dest_id, req_desc[req->req_type],
 			req->gfn, req->is_smm);
 
-    /* [Frontier] 发送阶段：忙等待保护 */
 retry_send:
+    /* [Modification] Pass pointer tx_add */
 	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
-				dsm_request), send_flags, &tx_add);
+				dsm_request), send_flags, tx_add);
     
     if (ret == -EAGAIN && is_atomic) {
+        /* [Modification] Deadlock prevention */
+        if (++retry_cnt > 1000000) {
+            printk_ratelimited(KERN_ERR "kvm-dsm: Atomic send deadlock to node %d detected.\n", dest_id);
+            kfree(tx_add);
+            return -ETIMEDOUT;
+        }
         cpu_relax();
-        touch_nmi_watchdog();        /* 防止硬死锁重启 */
-        touch_softlockup_watchdog(); /* [新增] 防止软死锁报错 */
-        goto retry_send;             /* 死磕直到缓冲区有空位 */
+        touch_nmi_watchdog();
+        touch_softlockup_watchdog();
+        goto retry_send;
     }
 	if (ret < 0)
 		goto done;
 
 	retry_cnt = 0;
     
-    /* [Frontier] 接收阶段：忙等待保护 */
 	if (req->req_type == DSM_REQ_INVALIDATE) {
 retry_recv_inv:
-		ret = network_ops.receive(*conn_sock, data, recv_flags, &tx_add);
+		ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
         if (ret == -EAGAIN && is_atomic) {
+            /* [Modification] Deadlock prevention */
+            if (++retry_cnt > 1000000) {
+                printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv_inv deadlock from node %d detected.\n", dest_id);
+                kfree(tx_add);
+                return -ETIMEDOUT;
+            }
             cpu_relax();
             touch_nmi_watchdog();
-            touch_softlockup_watchdog(); /* [新增] */
+            touch_softlockup_watchdog();
             goto retry_recv_inv;
         }
 	}
 	else {
 retry:
-		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, &tx_add);
+		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, tx_add);
 		if (ret == -EAGAIN) {
 			retry_cnt++;
             
-            /* [Frontier] 原子上下文死等逻辑 */
             if (is_atomic) {
+                /* [Modification] Deadlock prevention */
+                if (retry_cnt > 1000000) {
+                    printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv deadlock from node %d detected.\n", dest_id);
+                    kfree(tx_add);
+                    return -ETIMEDOUT;
+                }
                 cpu_relax();
                 touch_nmi_watchdog();
-                touch_softlockup_watchdog(); /* [新增] */
+                touch_softlockup_watchdog();
                 goto retry;
             }
 
-            /* 原有逻辑：普通上下文超时检测 */
+            /* Original timeout logic for non-atomic context */
 			if (retry_cnt > 100000) {
 				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
 						"kvm %d for too LONG",
@@ -214,13 +243,16 @@ retry:
 			}
 			goto retry;
 		}
-		resp->inv_copyset = tx_add.inv_copyset;
-		resp->version = tx_add.version;
+        /* [Modification] Access via pointer */
+		resp->inv_copyset = tx_add->inv_copyset;
+		resp->version = tx_add->version;
 	}
 	if (ret < 0)
 		goto done;
 
 done:
+    /* [Modification] Free memory before exit */
+    kfree(tx_add);
 	return ret;
 }
 
