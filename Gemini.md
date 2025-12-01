@@ -1238,7 +1238,7 @@ void dsm_universal_register(void *ptr, size_t size) {
 ---
 
 ## 3. 内存服务端脚本 (Mode B 专用)
-** SO_REUSEPORT 多进程版 (fast_mem_server.c) **
+**SO_REUSEPORT 多进程版 (fast_mem_server.c)**
 **文件：** `fast_mem_server.c`
 
 **【修改目标】**
