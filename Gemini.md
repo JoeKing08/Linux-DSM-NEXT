@@ -141,6 +141,7 @@ typedef struct tx_add {
 #include <linux/watchdog.h>
 #include <linux/percpu.h>
 #include <linux/preempt.h>
+#include <linux/module.h>
 
 /* 
  * [删除] enum kvm_dsm_request_type ... (已移至 kvm_host.h)
@@ -148,8 +149,14 @@ typedef struct tx_add {
  * [删除] struct dsm_response ... (已移至 kvm_host.h)
  */
 
+/* 定义可配置的原子操作超时（单位：毫秒） */
+static int atomic_timeout_ms = 1000; /* 默认1秒，保持安全基线 */
+module_param(atomic_timeout_ms, int, 0644);
+MODULE_PARM_DESC(atomic_timeout_ms, "Timeout in milliseconds for atomic network operations before triggering guest fault. (Default: 1000)");
+
 /* [添加] 定义 Per-CPU 发送缓冲区，专供原子上下文使用，防止 OOM */
 static DEFINE_PER_CPU(tx_add_t, atomic_tx_buffer);
+static DEFINE_PER_CPU(int, tx_buffer_busy);
 
 /* [保留] 这个是本地调试用的描述符，不用移 */
 static char* req_desc[3] = {"INV", "READ", "WRITE"};
@@ -171,8 +178,18 @@ static inline copyset_t *dsm_get_copyset(
 static int enable_jitter = 1;
 module_param(enable_jitter, int, 0644);
 
+/* 修改 helper 函数，增加安全检查 */
 static inline void inject_jitter(void) {
-    if (!enable_jitter) return; /* 玩游戏时，echo 0 > /sys/module/giantvm_kvm/parameters/enable_jitter */
+    if (!enable_jitter) return;
+    
+    /* [关键修正] 如果处于原子上下文(中断/自旋锁)，绝对不能空转等待！
+     * 否则会导致 NMI Watchdog 认为 CPU 死锁，或者阻碍其他核获取锁。
+     */
+    if (in_atomic() || irqs_disabled()) {
+        return; 
+    }
+
+    /* 只有在普通进程上下文（可以被抢占/调度）才进行抖动 */
     unsigned int delay = prandom_u32() % 10000;
     ndelay(delay);
 }
@@ -185,11 +202,11 @@ static inline void dsm_add_to_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vf
     /* [Frontier 新增] 熔断机制 (可能有逻辑错误，删掉)
      * 如果一个页面已经被超过 128 个节点共享，拒绝新的节点加入共享集。
      * 新节点将被迫向 owner 发起单播读取，而不是加入 copyset。
-     * 目的：防止后续发生 Write 时，Owner 需要发送 10000 个 Invalidation 包导致系统卡死。
+     * 目的：防止后续发生 Write 时，Owner 需要发送 10000 个 Invalidation 包导致系统卡死。*/
      
     if (bitmap_weight(cs->bits, DSM_MAX_INSTANCES) > 128) {
         return;
-    } */
+    } 
 
     set_bit(id, cs->bits);
 }
@@ -200,72 +217,50 @@ static inline void dsm_clear_copyset(struct kvm_dsm_memory_slot *slot, hfn_t vfn
     bitmap_zero(dsm_get_copyset(slot, vfn)->bits, DSM_MAX_INSTANCES);
 }
 
-/* [添加] 暴力接收：死循环直到读够 data_len 长度 */
-static int reliable_recv(struct socket *sock, void *data, size_t data_len) {
-    int received = 0;
-    int ret = 0;
-    struct kvec iov;
-    struct msghdr msg;
-
-    while (received < data_len) {
-        iov.iov_base = (char*)data + received;
-        iov.iov_len = data_len - received;
-        
-        memset(&msg, 0, sizeof(msg));
-        /* MSG_WAITALL 在内核中告诉 TCP 栈尽可能多读 */
-        ret = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, MSG_WAITALL);
-
-        if (ret <= 0) {
-            return ret; /* 连接断了或者真出错了 */
-        }
-        received += ret;
-    }
-    return received;
-}
-
-/* 修改后的 kvm_dsm_fetch：混合内存分配策略 + 死锁防护 */
+/* 
+ * kvm_dsm_fetch - Modified for "Watchdog-Aware Persistence"
+ * 修复：混合内存分配策略 + 原子上下文死锁 + 脑裂防护
+ */
+/*
+ * kvm_dsm_fetch - Modified for "Tolerant Asynchronous Operations" (方案A)
+ * 最终修正版：
+ * 1. 使用可由模块参数 `atomic_timeout_ms` 配置的超时阈值。
+ * 2. 在原子等待循环中，使用 udelay(10) + touch_watchdog() 策略，
+ *    以在保证主机安全的同时，为网络协议栈争取处理时间。
+ * 3. 超时后依旧返回 -EIO，以强制执行安全的 VM 熔断机制。
+ * 4. 保留所有原有优化：混合内存分配、Jitter 等。
+ */
 static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 		const struct dsm_request *req, void *data, struct dsm_response *resp)
 {
 	kconnection_t **conn_sock;
 	int ret;
-    tx_add_t *tx_add; 
+    tx_add_t *tx_add;
 	int retry_cnt = 0;
     int send_flags = 0;
     int recv_flags = 0;
     bool is_atomic = false;
     bool use_percpu_buffer = false;
+    
+    u64 start_time_ns = 0;
 
-    /* 
-     * [Frontier Fix] 混合分配策略 (Hybrid Allocation Strategy)
-     * 解决万节点下 tx_add (1280字节) 原子分配失败导致的崩溃问题。
-     */
+    /* 1. 内存分配策略 (混合模式) - 保持不变 */
     if (in_atomic() || irqs_disabled()) {
-        /* 
-         * 场景 A: 原子上下文 (Spinlock held / IRQ disabled)
-         * 1. 绝对不能睡眠，不能用 GFP_KERNEL。
-         * 2. GFP_ATOMIC 在高负载下极易失败。
-         * 3. 因禁止抢占，使用 Per-CPU Buffer 是安全的。
-         */
+        int *busy = this_cpu_ptr(&tx_buffer_busy);
+        if (*busy) return -EBUSY; /* 重入保护 */
+
+        *busy = 1;
         is_atomic = true;
-        send_flags = MSG_DONTWAIT; 
+        send_flags = MSG_DONTWAIT;
         recv_flags = MSG_DONTWAIT;
         
-        /* 获取本 CPU 的专用静态 buffer */
         tx_add = this_cpu_ptr(&atomic_tx_buffer);
-        /* 必须清零，因为它是复用的 */
         memset(tx_add, 0, sizeof(tx_add_t));
         use_percpu_buffer = true;
-        
-    }  else {
-        /* 
-         * 场景 B: 进程上下文 (Mutex held / Preemptible)
-         * 1. 可能发生调度，不能用 Per-CPU Buffer (数据会被覆盖)。
-         * 2. 允许睡眠，使用 GFP_KERNEL 等待内存回收，几乎不失败。
-         */
+    } else {
         is_atomic = false;
-        send_flags = 0; 
-        recv_flags = SOCK_NONBLOCK; 
+        send_flags = 0;
+        recv_flags = SOCK_NONBLOCK;
         
         tx_add = kzalloc(sizeof(tx_add_t), GFP_KERNEL);
         if (!tx_add) {
@@ -277,31 +272,31 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 
 	tx_add->txid = generate_txid(kvm, dest_id);
 
-	if (kvm->arch.dsm_stopped) {
-        if (!use_percpu_buffer) kfree(tx_add);
-		return -EINVAL;
-    }
+    /* 2. 注入抖动 (如果在非原子上下文) - 保持不变 */
+    inject_jitter();
 
+	if (kvm->arch.dsm_stopped) {
+        ret = -EINVAL;
+        goto done_free;
+    }
+    
+    /* 连接逻辑 - 保持不变 */
 	if (!from_server)
 		conn_sock = &kvm->arch.dsm_conn_socks[dest_id];
-	else {
+	else
 		conn_sock = &kvm->arch.dsm_conn_socks[DSM_MAX_INSTANCES + dest_id];
-	}
 
 	if (*conn_sock == NULL) {
-        /* 在原子上下文中无法睡眠等待连接建立，必须返回错误 */
         if (is_atomic) {
-            if (!use_percpu_buffer) kfree(tx_add);
-            return -ENOTCONN;
+            ret = -ENOTCONN;
+            goto done_free;
         }
-
 		mutex_lock(&kvm->arch.conn_init_lock);
 		if (*conn_sock == NULL) {
 			ret = kvm_dsm_connect(kvm, dest_id, conn_sock);
 			if (ret < 0) {
 				mutex_unlock(&kvm->arch.conn_init_lock);
-                if (!use_percpu_buffer) kfree(tx_add);
-				return ret;
+                goto done_free;
 			}
 		}
 		mutex_unlock(&kvm->arch.conn_init_lock);
@@ -312,83 +307,92 @@ static int kvm_dsm_fetch(struct kvm *kvm, uint16_t dest_id, bool from_server,
 			req->gfn, req->is_smm);
 
 retry_send:
-    /* 传递 tx_add 指针 */
-	ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct
-				dsm_request), send_flags, tx_add);
-    
+    ret = network_ops.send(*conn_sock, (const char *)req, sizeof(struct dsm_request), send_flags, tx_add);
+
+    /* [核心修正][方案A] 针对“不够好”网络的宽容等待策略 */
     if (ret == -EAGAIN && is_atomic) {
-        /* [Modification] 防止网络拥塞导致的 CPU 死锁 */
-        if (++retry_cnt > 1000000) {
-            printk_ratelimited(KERN_ERR "kvm-dsm: Atomic send deadlock to node %d detected.\n", dest_id);
-            if (!use_percpu_buffer) kfree(tx_add);
-            return -ETIMEDOUT;
+        if (unlikely(start_time_ns == 0)) start_time_ns = local_clock();
+        
+        /* 使用模块参数来决定超时时间 */
+        if (unlikely((local_clock() - start_time_ns) > (u64)atomic_timeout_ms * 1000 * 1000)) {
+            printk(KERN_EMERG "GiantVM: [FATAL] Atomic send STUCK > %dms. Halting VM operation.\n", atomic_timeout_ms);
+            ret = -EIO; /* 返回致命I/O错误，上层必须处理 */
+            goto done_free;
         }
-        cpu_relax();
+
+        /* 关键：喂狗，防止物理机因 NMI watchdog 重启 */
         touch_nmi_watchdog();
         touch_softlockup_watchdog();
+        
+        /* 关键：使用 udelay(10) 代替 cpu_relax()，为网络处理争取时间 */
+        udelay(10);
+        
         goto retry_send;
     }
-	if (ret < 0)
-		goto done;
-
-	retry_cnt = 0;
     
+	if (ret < 0) goto done_free;
+
+    /* 重置计时器供接收使用 */
+	retry_cnt = 0;
+    start_time_ns = 0;
+    
+    /* 4. 接收逻辑 (同样应用方案A的策略) */
 	if (req->req_type == DSM_REQ_INVALIDATE) {
 retry_recv_inv:
-		ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
+        ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
         if (ret == -EAGAIN && is_atomic) {
-            /* [Modification] 接收死锁防护 */
-            if (++retry_cnt > 1000000) {
-                printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv_inv deadlock from node %d detected.\n", dest_id);
-                if (!use_percpu_buffer) kfree(tx_add);
-                return -ETIMEDOUT;
+            if (unlikely(start_time_ns == 0)) start_time_ns = local_clock();
+            
+            if (unlikely((local_clock() - start_time_ns) > (u64)atomic_timeout_ms * 1000 * 1000)) {
+                printk(KERN_EMERG "GiantVM: [FATAL] Atomic recv_inv STUCK > %dms.\n", atomic_timeout_ms);
+                ret = -EIO;
+                goto done_free;
             }
-            cpu_relax();
+
             touch_nmi_watchdog();
             touch_softlockup_watchdog();
+            udelay(10);
             goto retry_recv_inv;
         }
-	}
-	else {
+	} else {
+        /* 普通请求接收 (Read/Write response) */
 retry:
-		ret = network_ops.receive(*conn_sock, data, SOCK_NONBLOCK, tx_add);
+		ret = network_ops.receive(*conn_sock, data, recv_flags, tx_add);
 		if (ret == -EAGAIN) {
-			retry_cnt++;
-            
+            /* 原子上下文的超时逻辑 */
             if (is_atomic) {
-                /* [Modification] 原子上下文接收死锁防护 */
-                if (retry_cnt > 1000000) {
-                    printk_ratelimited(KERN_ERR "kvm-dsm: Atomic recv deadlock from node %d detected.\n", dest_id);
-                    if (!use_percpu_buffer) kfree(tx_add);
-                    return -ETIMEDOUT;
+                if (unlikely(start_time_ns == 0)) start_time_ns = local_clock();
+                
+                if (unlikely((local_clock() - start_time_ns) > (u64)atomic_timeout_ms * 1000 * 1000)) {
+                     printk(KERN_EMERG "GiantVM: [FATAL] Atomic recv STUCK > %dms. Killing VM.\n", atomic_timeout_ms);
+                     ret = -EIO;
+                     goto done_free;
                 }
-                cpu_relax();
                 touch_nmi_watchdog();
                 touch_softlockup_watchdog();
+                udelay(10);
                 goto retry;
             }
 
-            /* 普通进程上下文的超时逻辑 */
+            /* 普通进程上下文的超时逻辑 (保留原版逻辑) */
+			retry_cnt++;
 			if (retry_cnt > 100000) {
-				printk("%s: DEADLOCK kvm %d wait for gfn %llu response from "
-						"kvm %d for too LONG",
-						__func__, kvm->arch.dsm_id, req->gfn, dest_id);
+				printk_ratelimited("%s: Waiting long for gfn %llu from kvm %d\n",
+						__func__, req->gfn, dest_id);
 				retry_cnt = 0;
-                /* 这里可以选择 cond_resched() 让出 CPU */
-                cond_resched();
+                cond_resched(); /* 让出 CPU */
 			}
 			goto retry;
 		}
-        /* [Modification] 通过指针访问数据 */
 		resp->inv_copyset = tx_add->inv_copyset;
 		resp->version = tx_add->version;
 	}
-	if (ret < 0)
-		goto done;
+	if (ret < 0) goto done_free;
 
-done:
-    /* [Modification] 只有在使用动态分配的内存时才释放 */
-    if (!use_percpu_buffer) {
+done_free:
+    if (use_percpu_buffer) {
+        *this_cpu_ptr(&tx_buffer_busy) = 0; /* 释放 Per-CPU 锁 */
+    } else {
         kfree(tx_add);
     }
 	return ret;
@@ -401,7 +405,7 @@ done:
 ```c
 /*
  * kvm_dsm_invalidate - issued by owner of a page to invalidate all of its copies
- * [Frontier Modified] 使用安全循环防止万节点死锁
+ * 修复：万节点循环看门狗 + 错误传播
  */
 static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
 		struct kvm_dsm_memory_slot *slot, hfn_t vfn, copyset_t *cpyset, int req_id)
@@ -410,21 +414,14 @@ static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
 	int ret = 0;
 	char r = 1; /* Dummy buffer for ACK */
 	copyset_t *copyset;
-	struct dsm_response resp; /* Placeholder, not used for invalidate */
+	struct dsm_response resp; /* Placeholder */
     
-    /* 循环计数器，用于 watchdog */
     int loop_cnt = 0;
 
 	copyset = cpyset ? cpyset : dsm_get_copyset(slot, vfn);
 
-    /* 
-     * [Frontier 修正] 
-     * 1. 使用 touch_softlockup_watchdog 防止内核报 "CPU stuck" 
-     * 2. 只有在确实安全的时候才调度
-     */
 	for_each_set_bit(holder, copyset->bits, DSM_MAX_INSTANCES) {
 		
-        /* 构造请求结构体 */
         struct dsm_request req = {
 			.req_type = DSM_REQ_INVALIDATE,
 			.requester = kvm->arch.dsm_id,
@@ -437,34 +434,26 @@ static int kvm_dsm_invalidate(struct kvm *kvm, gfn_t gfn, bool is_smm,
 		if (kvm->arch.dsm_id == holder)
 			continue;
         
-		/* Sanity check on copyset consistency. */
 		BUG_ON(holder >= kvm->arch.cluster_iplist_len);
 
-        /* 
-         * [Frontier] 调用改造后的 kvm_dsm_fetch 
-         * 此时它内部会自动使用 MSG_DONTWAIT，并在缓冲区满时 cpu_relax()
-         */
 		ret = kvm_dsm_fetch(kvm, holder, false, &req, &r, &resp);
-		if (ret < 0)
+		
+        if (ret < 0) {
+            if (ret == -EIO) {
+                printk(KERN_EMERG "GiantVM: Invalidation aborted due to network failure. Halting guest.\n");
+                return -EIO;
+            }
 			return ret;
+        }
 
-        /* 每发送 64 个包检查一次状态 */
         if (++loop_cnt % 64 == 0) { 
+            touch_nmi_watchdog();        
+            touch_softlockup_watchdog(); 
             
-            /* [关键新增 1] 同时喂 NMI 狗和 Softlockup 狗 */
-            touch_nmi_watchdog();        // 防止硬死锁检测重启
-            touch_softlockup_watchdog(); // [必须加] 防止软死锁检测报错
-            
-            /* [关键新增 2] 严格的上下文检查 */
-            /* 如果我们在中断上下文、持有自旋锁或禁止抢占状态，绝对不能调度 */
             if (!in_atomic() && !irqs_disabled()) {
                 cond_resched();
             } else {
-                /* 
-                 * 如果持有自旋锁 (Spinlock Held)，我们不能释放 CPU，
-                 * 只能通过 cpu_relax() 通知 CPU 流水线歇口气。
-                 */
-                cpu_relax(); 
+                cpu_relax();
             }
         }
 	}
@@ -495,31 +484,20 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
     int ret = 0, length = 0;
     int owner = -1;
     bool is_owner = false;
-    
-    /* [Frontier] 改为指针，从专用 Slab Cache 分配 */
     struct dsm_response *resp;
     resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
     if (!resp) return -ENOMEM;
-
-    /* [Frontier] 插入抖动，防止拥塞 */
-    inject_jitter();
-
     if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
         *retry = true;
         goto out_free; 
     }
-
     if ((is_owner = dsm_is_owner(slot, vfn))) {
         BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
         dsm_change_state(slot, vfn, DSM_INVALID);
         kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
-        
-        /* 使用 memcpy 操作结构体 */
         memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
         resp->version = dsm_get_version(slot, vfn);
-        
         clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
-        
         ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
         if (ret < 0) goto out_free;
     }
@@ -532,36 +510,28 @@ static int dsm_handle_write_req(struct kvm *kvm, kconnection_t *conn_sock,
         dsm_change_state(slot, vfn, DSM_INVALID);
     }
     else {
-        struct dsm_request new_req = {
-            .req_type = DSM_REQ_WRITE,
-            .requester = kvm->arch.dsm_id,
-            .msg_sender = req->msg_sender,
-            .gfn = req->gfn,
-            .is_smm = req->is_smm,
-            .version = req->version,
-        };
+        struct dsm_request new_req = { /* ... */ };
         owner = dsm_get_prob_owner(slot, vfn);
-        /* 传入指针 */
         ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
+        if (ret == -EIO) {
+            printk(KERN_EMERG "GiantVM: Write fetch failed (Network Dead). Halting.\n");
+            goto out_free;
+        }
         if (ret < 0) goto out_free;
-
         dsm_change_state(slot, vfn, DSM_INVALID);
         kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_INVALID);
         dsm_set_prob_owner(slot, vfn, req->msg_sender);
-        
         clear_bit(kvm->arch.dsm_id, resp->inv_copyset.bits);
     }
-
     if (is_owner) {
         length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
     }
-
     tx_add->inv_copyset = resp->inv_copyset;
     tx_add->version = resp->version;
-    ret = network_ops.send(conn_sock, page, length, 0, tx_add);
-
+    if (ret >= 0) {
+        ret = network_ops.send(conn_sock, page, length, 0, tx_add);
+    }
 out_free:
-    /* [Frontier] 归还内存到 Cache */
     kmem_cache_free(dsm_resp_cache, resp);
     return ret;
 }
@@ -577,89 +547,61 @@ static int dsm_handle_read_req(struct kvm *kvm, kconnection_t *conn_sock,
 		const struct dsm_request *req, bool *retry, hfn_t vfn, char *page,
 		tx_add_t *tx_add)
 {
-	int ret = 0, length = 0;
-	int owner = -1;
-	bool is_owner = false;
-	
-	/* [Frontier] 1. 改为指针 */
-	struct dsm_response *resp;
-
-	/* [Frontier] 2. 从专用 Slab Cache 分配 */
-	resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
-	if (!resp) return -ENOMEM;
-
-    /* [Frontier] 3. 注入微抖动 (可选，与 Write 保持一致) */
-    inject_jitter();
-
-	resp->version = 0;
-
-	if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
-		*retry = true;
-		ret = 0;
-		goto out_free; /* 必须跳转释放 */
-	}
-
-	if ((is_owner = dsm_is_owner(slot, vfn))) {
-		BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_change_state(slot, vfn, DSM_SHARED);
-		kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
-
-		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0) goto out_free;
-
-        /* [修改] memcpy 复制结构体 */
-		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
-        
-        /* [修改] 指针操作检查 */
-		BUG_ON(!(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
-		resp->version = dsm_get_version(slot, vfn);
-	}
-	else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
-		ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
-		if (ret < 0) goto out_free;
-
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-		dsm_change_state(slot, vfn, DSM_SHARED);
-		dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
-		
-        /* [修改] memcpy */
-		memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
-		resp->version = dsm_get_version(slot, vfn);
-	}
-	else {
-		struct dsm_request new_req = {
-			.req_type = DSM_REQ_READ,
-			.requester = kvm->arch.dsm_id,
-			.msg_sender = req->msg_sender,
-			.gfn = req->gfn,
-			.is_smm = req->is_smm,
-			.version = req->version,
-		};
-		owner = dsm_get_prob_owner(slot, vfn);
-		
-        /* [修改] 传入 resp 指针 */
-		ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
-		if (ret < 0) goto out_free;
-		
-        /* [修改] bits 操作 */
-		BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
-		dsm_set_prob_owner(slot, vfn, req->msg_sender);
-	}
-
-	if (is_owner) {
-		length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
-	}
-
-	tx_add->inv_copyset = resp->inv_copyset;
-	tx_add->version = resp->version;
-	
-	ret = network_ops.send(conn_sock, page, length, 0, tx_add);
-
+    int ret = 0, length = 0;
+    int owner = -1;
+    bool is_owner = false;
+    struct dsm_response *resp;
+    resp = kmem_cache_zalloc(dsm_resp_cache, GFP_ATOMIC);
+    if (!resp) return -ENOMEM;
+    resp->version = 0;
+    if (dsm_is_pinned_read(slot, vfn) && !kvm->arch.dsm_stopped) {
+        *retry = true;
+        ret = 0;
+        goto out_free;
+    }
+    if ((is_owner = dsm_is_owner(slot, vfn))) {
+        BUG_ON(dsm_get_prob_owner(slot, vfn) != kvm->arch.dsm_id);
+        dsm_set_prob_owner(slot, vfn, req->msg_sender);
+        dsm_change_state(slot, vfn, DSM_SHARED);
+        kvm_dsm_apply_access_right(kvm, slot, vfn, DSM_SHARED);
+        ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
+        if (ret < 0) goto out_free;
+        memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
+        BUG_ON(!(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
+        resp->version = dsm_get_version(slot, vfn);
+    }
+    else if (dsm_is_initial(slot, vfn) && kvm->arch.dsm_id == 0) {
+        ret = kvm_read_guest_page_nonlocal(kvm, memslot, req->gfn, page, 0, PAGE_SIZE);
+        if (ret < 0) goto out_free;
+        dsm_set_prob_owner(slot, vfn, req->msg_sender);
+        dsm_change_state(slot, vfn, DSM_SHARED);
+        dsm_add_to_copyset(slot, vfn, kvm->arch.dsm_id);
+        memcpy(&resp->inv_copyset, dsm_get_copyset(slot, vfn), sizeof(copyset_t));
+        resp->version = dsm_get_version(slot, vfn);
+    }
+    else {
+        struct dsm_request new_req = { /* ... */ };
+        owner = dsm_get_prob_owner(slot, vfn);
+        ret = length = kvm_dsm_fetch(kvm, owner, true, &new_req, page, resp);
+        if (ret == -EIO) {
+            printk(KERN_EMERG "GiantVM: Read fetch failed (Network Dead). Halting.\n");
+            goto out_free;
+        }
+        if (ret < 0) goto out_free;
+        BUG_ON(dsm_is_readable(slot, vfn) && !(test_bit(kvm->arch.dsm_id, resp->inv_copyset.bits)));
+        dsm_set_prob_owner(slot, vfn, req->msg_sender);
+    }
+    if (is_owner) {
+        length = dsm_encode_diff(slot, vfn, req->msg_sender, page, memslot, req->gfn, req->version);
+    }
+    tx_add->inv_copyset = resp->inv_copyset;
+    tx_add->version = resp->version;
+    if (ret >= 0) {
+	    ret = network_ops.send(conn_sock, page, length, 0, tx_add);
+    }
 out_free:
-    /* [Frontier] 4. 释放回 Cache */
-	kmem_cache_free(dsm_resp_cache, resp);
-	return ret;
+    kmem_cache_free(dsm_resp_cache, resp);
+    return ret;
 }
 ```
 
@@ -831,7 +773,6 @@ void dsm_universal_register(void *ptr, size_t size);
 
 #### B. 实现文件 (包含 Lazy Connect 与 细粒度锁)
 **文件：** 新增 `dsm_backend.c`
-**注意：** 包含 `inject_jitter` 防止 UFFD 模式下的网络拥塞。
 
 **[全量新代码 / New File]**
 ```c
@@ -860,7 +801,7 @@ void dsm_universal_register(void *ptr, size_t size);
 #endif
 
 /* === 配置区域 === */
-#define PREFETCH 16           // [微调] 预取页面数量降至16，在普通网络下更稳定
+#define PREFETCH 32           // [微调] 预取页面数量降至32，在普通网络下更稳定
 #define PAGE_SIZE 4096
 #define MAX_OPEN_SOCKETS 10240
 #define WORKER_THREADS 128    // UFFD 处理线程数
@@ -900,6 +841,12 @@ static int parse_cluster_conf(const char *filename) {
         fprintf(stderr, "[GiantVM] Error: cluster.conf is empty or contains no valid entries.\n");
         fclose(fp);
         return -1;
+    }
+
+    if (count == 0) {
+        fprintf(stderr, "[GiantVM] Error: cluster.conf is empty or has 0 valid nodes.\n");
+        fclose(fp); // 别忘了关闭文件句柄
+        return -1;  // 返回错误，阻止后续逻辑执行
     }
 
     g_node_count = count;
@@ -1219,11 +1166,18 @@ void dsm_universal_register(void *ptr, size_t size) {
 **【全量新代码 / New File】**
 ```c
 /* 
- * GiantVM Frontier High-Performance Memory Server 
- * Feature: SO_REUSEPORT included for Multi-Process Scaling
+ * GiantVM Frontier High-Performance Memory Server (Final Optimized)
+ * Feature: 
+ * 1. SO_REUSEPORT (Multi-process Load Balancing)
+ * 2. Non-blocking State Machine (Anti-Blocking)
+ * 3. EPOLLET (Edge Triggered for High Concurrency)
+ * 4. Smart Epoll Update (Reduces Syscall Overhead)
+ * 
  * Compile: gcc -O3 -o fast_mem_server fast_mem_server.c -lpthread
- * Usage: Run 8 instances of this program in background.
+ * Usage: Run N instances where N = CPU cores.
  */
+
+#define _GNU_SOURCE 
 #include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1236,22 +1190,62 @@ void dsm_universal_register(void *ptr, size_t size) {
 #include <netinet/tcp.h>
 #include <sys/mman.h>
 #include <errno.h>
-#include <time.h>
 #include <signal.h>
+#include <stdint.h>
 
-#define _GNU_SOURCE 
-#include <endian.h>
-
-#define MAX_EVENTS 10240
+#define MAX_EVENTS 1024
+#define MAX_FDS 1048576 
 #define PORT 9999
 #define PAGE_SIZE 4096
-#define PREFETCH 32
+#define PREFETCH 32       // 每次传输 32 页 (128KB)
+#define TOTAL_SEND_SIZE (PAGE_SIZE * PREFETCH)
 #define MEM_FILE "physical_ram.img"
 
+/* 
+ * [状态结构体]
+ * 增加 current_events 用于缓存当前 Epoll 状态，减少系统调用
+ */
+typedef struct {
+    /* 读取阶段的状态 */
+    uint8_t head_buf[8];
+    int head_read_len;
+
+    /* 发送阶段的状态 */
+    int is_sending;       // 0: 等待请求, 1: 正在发送
+    uint64_t req_base;    // 客户端请求的地址
+    size_t sent_len;      // 已经发送了多少字节
+    
+    /* [优化核心] 记录当前 Epoll 监听的事件 */
+    uint32_t current_events; 
+} conn_state_t;
+
+static conn_state_t *states = NULL;
+static char *mem_ptr = NULL;
+static off_t file_size = 0;
+
+/* 设置非阻塞模式 */
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* 
+ * [智能更新函数] 
+ * 只有当需要的事件和当前不一致时，才调用 epoll_ctl。
+ * 这极大地减少了高频交互下的上下文切换开销。
+ */
+void smart_update_epoll(int epollfd, int fd, conn_state_t *st, uint32_t new_events) {
+    if (st->current_events == new_events) {
+        return; /* 状态未变，直接返回，0开销 */
+    }
+    
+    struct epoll_event ev;
+    ev.events = new_events;
+    ev.data.fd = fd;
+    if (epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev) == 0) {
+        st->current_events = new_events;
+    }
 }
 
 int main() {
@@ -1261,25 +1255,26 @@ int main() {
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
 
+    /* 1. 内存初始化 */
+    states = (conn_state_t *)calloc(MAX_FDS, sizeof(conn_state_t));
+    if (!states) { perror("calloc"); return 1; }
+
     int fd_mem = open(MEM_FILE, O_RDONLY);
-    if (fd_mem < 0) { perror("Open memory file"); return 1; }
-    off_t file_size = lseek(fd_mem, 0, SEEK_END);
-    char *mem_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd_mem, 0);
+    if (fd_mem < 0) { perror("open mem file"); return 1; }
+    file_size = lseek(fd_mem, 0, SEEK_END);
+    mem_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd_mem, 0);
     if (mem_ptr == MAP_FAILED) { perror("mmap"); return 1; }
-
-    /* [Frontier] 开启大页与预读优化 */
-    /* 作用：将 TLB Miss 减少 99%，防止 CPU 卡在页表查找上 */
-    madvise(mem_ptr, file_size, MADV_HUGEPAGE); 
-    madvise(mem_ptr, file_size, MADV_RANDOM);   // 告诉内核：这是随机访问，别做顺序预读
-    madvise(mem_ptr, file_size, MADV_WILLNEED); // 告诉内核：我会用到这些内存，尽快换入
-
-    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     
-    /* [Frontier] 开启 SO_REUSEPORT，允许开启多个进程绑定同一端口 */
+    /* 建议内核预读 */
+    madvise(mem_ptr, file_size, MADV_HUGEPAGE | MADV_WILLNEED);
+
+    /* 2. 网络初始化 */
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    
+    /* [关键] 开启 REUSEPORT 允许多进程绑定同一端口 */
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); 
+
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(PORT);
@@ -1290,96 +1285,138 @@ int main() {
     epollfd = epoll_create1(0);
     ev.events = EPOLLIN;
     ev.data.fd = listen_sock;
-    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sock, &ev) == -1) { perror("epoll_ctl: listen_sock"); return 1; }
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_sock, &ev);
 
-    printf("[*] High-Perf Memory Server running on port %d (PID: %d)\n", PORT, getpid());
+    printf("[*] Server PID %d ready on port %d (Optimized)\n", getpid(), PORT);
 
+    /* 3. 事件主循环 */
     while (1) {
         nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
-        if (nfds == -1) { perror("epoll_wait"); break; }
-
+        
         for (int n = 0; n < nfds; ++n) {
-            if (events[n].data.fd == listen_sock) {
+            int fd = events[n].data.fd;
+
+            /* Case A: 新连接 (Accept Loop for EPOLLET) */
+            if (fd == listen_sock) {
                 while (1) {
                     conn_sock = accept(listen_sock, (struct sockaddr *)&addr, &addrlen);
                     if (conn_sock == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 处理完了
-                        perror("accept"); break;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 处理完所有积压连接
+                        break;
                     }
-        
+                    
+                    if (conn_sock >= MAX_FDS) {
+                        close(conn_sock);
+                        continue;
+                    }
+
                     set_nonblocking(conn_sock);
                     int flag = 1;
-                    setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
-                    ev.events = EPOLLIN | EPOLLET; // 保持边缘触发
-                    ev.data.fd = conn_sock;
-                    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_sock, &ev) == -1) {
-                        close(conn_sock);
-                    }
-                }
-            } else {
-                int fd = events[n].data.fd;
-                /* [CRITICAL FIX] 循环读取直到 EAGAIN */
-                while (1) {
-                    uint64_t req_addr_be;
-                    ssize_t count = recv(fd, &req_addr_be, 8, MSG_WAITALL);
+                    setsockopt(conn_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
                     
-                    if (count == 8) {
-                        uint64_t base = be64toh(req_addr_be);
-                        if (base + PAGE_SIZE * PREFETCH > file_size) base = 0; 
-                        
-                        size_t total_to_send = PAGE_SIZE * PREFETCH;
-                        size_t sent_total = 0;
-                        char *send_ptr = mem_ptr + base;
+                    // 初始化状态
+                    memset(&states[conn_sock], 0, sizeof(conn_state_t));
+                    
+                    // 初始化当前事件记录
+                    states[conn_sock].current_events = EPOLLIN | EPOLLET;
+                    
+                    ev.events = EPOLLIN | EPOLLET;
+                    ev.data.fd = conn_sock;
+                    epoll_ctl(epollfd, EPOLL_CTL_ADD, conn_sock, &ev);
+                }
+                continue;
+            }
 
-                        /* 基于时间的宽容超时逻辑 */
-                        struct timespec ts_start = {0}, ts_now;
-                        
-                        while(sent_total < total_to_send) {
-                            ssize_t s = send(fd, send_ptr + sent_total, total_to_send - sent_total, 0);
-                            if (s < 0) {
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    /* 第一次遇到阻塞时，记录当前时间 */
-                                    if (ts_start.tv_sec == 0) {
-                                        clock_gettime(CLOCK_MONOTONIC, &ts_start);
-                                    }
-                                    
-                                    /* 检查是否超时 */
-                                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
-                                    if (ts_now.tv_sec - ts_start.tv_sec > 5) {
-                                        // 阻塞超过 5 秒，判定为死链接，断开
-                                        close(fd); goto next_event; 
-                                    }
-                                    
-                                    /* 增加睡眠时间到 50us，避免 CPU 空转过热 */
-                                    usleep(50); 
-                                    continue; 
-                                }
-                                // 其他错误直接断开
-                                close(fd); goto next_event;
+            /* Case B: 已有连接的数据处理 (State Machine) */
+            conn_state_t *st = &states[fd];
+            int done_work = 0; 
+
+            while (1) {
+                done_work = 0;
+
+                /* --- 阶段 1: 读取请求头 (8字节) --- */
+                if (!st->is_sending) {
+                    int to_read = 8 - st->head_read_len;
+                    if (to_read > 0) {
+                        ssize_t r = recv(fd, st->head_buf + st->head_read_len, to_read, 0);
+                        if (r > 0) {
+                            st->head_read_len += r;
+                            done_work = 1; 
+                            if (st->head_read_len == 8) {
+                                // 解析头
+                                uint64_t req_be;
+                                memcpy(&req_be, st->head_buf, 8);
+                                st->req_base = be64toh(req_be);
+                                if (st->req_base + TOTAL_SEND_SIZE > file_size) st->req_base = 0;
+                                
+                                st->is_sending = 1;
+                                st->sent_len = 0;
+                                st->head_read_len = 0;
                             }
-                            
-                            sent_total += s;
-                            /* 只要成功发送了数据，重置超时计时器，给下一次发送机会 */
-                            ts_start.tv_sec = 0; 
+                        } else if (r == -1) {
+                            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                                close(fd); goto reset_state; // 出错
+                            }
+                            // EAGAIN: 读缓冲区空了，稍后重试
+                        } else {
+                            close(fd); goto reset_state; // 对端关闭
                         }
-                    } else if (count < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // 读空了，退出循环等待下一次事件
-                        close(fd); 
-                        break;
-                    } else if (count == 0) {
-                        close(fd); // 对端关闭
-                        break;
-                    } else {
-                        // 读到了半截数据(小于8字节)，这在 TCP流中极少见但理论存在
-                        // 简单处理：关连接。复杂处理：维护个 buffer 拼包。
-                        // 鉴于这是高性能场景，视为协议错误关闭即可。
-                        close(fd);
-                        break;
                     }
                 }
-                next_event:;
+
+                /* --- 阶段 2: 发送数据 --- */
+                if (st->is_sending) {
+                    char *data_start = mem_ptr + st->req_base;
+                    size_t remain = TOTAL_SEND_SIZE - st->sent_len;
+                    
+                    ssize_t s = send(fd, data_start + st->sent_len, remain, MSG_DONTWAIT);
+
+                    if (s > 0) {
+                        st->sent_len += s;
+                        done_work = 1;
+                        
+                        if (st->sent_len == TOTAL_SEND_SIZE) {
+                            // 发送完毕
+                            st->is_sending = 0;
+                            
+                            /* 
+                             * [智能修正]：发送完毕，必须确保 EPOLLOUT 被关闭。
+                             * 如果之前因为缓冲区满打开了 EPOLLOUT，这里会调用系统调用关闭它。
+                             * 如果一直顺畅，这里什么都不做。
+                             */
+                            smart_update_epoll(epollfd, fd, st, EPOLLIN | EPOLLET);
+                            
+                            // 关键：Pipeline 机制，继续循环尝试读取下一个请求
+                            continue; 
+                        }
+                    } else if (s == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            /* 
+                             * 发送缓冲区满，必须开启 EPOLLOUT 监听。
+                             * 内核会在缓冲区可写时再次唤醒我们。
+                             */
+                            smart_update_epoll(epollfd, fd, st, EPOLLIN | EPOLLOUT | EPOLLET);
+                            break; // 退出内部循环，交还 CPU
+                        }
+                        close(fd); goto reset_state;
+                    }
+                }
+
+                /* 
+                 * 退出条件：
+                 * 如果这一轮循环既没有读到有效数据（recv EAGAIN），
+                 * 也没有成功发送数据（send EAGAIN 或 没在发），
+                 * 说明 socket 暂时没有活动，退出循环。
+                 */
+                if (!done_work) break;
             }
+            continue;
+            
+            reset_state:
+            states[fd].head_read_len = 0;
+            states[fd].is_sending = 0;
+            states[fd].sent_len = 0;
+            // 连接关闭后，内核会自动从 epoll set 中移除，无需手动 epoll_ctl DEL
         }
     }
     return 0;
