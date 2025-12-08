@@ -27,45 +27,40 @@
 #### 1. 架构示意图 (The Topology)
 
 ```text
+
                                      [ 显示器 / 键鼠终端 ]
-                                             | (HDMI/USB 直连，零延迟，原生画质)
+                                             |
                                              v
 +-------------------------------------------------------------------------------------------+
-|  [ Master Node (Head) ]  (配置: E5 CPU + RTX 4090 + NVMe SSD)                             |
-|  (角色: 全局主控 / 游戏运行环境 / 唯一入口)                                                 |
+|  [ Master Node (Head) ]  (物理机, Linux 5.4, root权限)                                    |
+|  (角色: 游戏/应用运行环境, 静态槽位管理)                                                     |
 |                                                                                           |
-|      (1. 游戏资源/GUI 路径 - 纯本地，零网络)                                              |
-|      [QEMU 主进程] =====(VFIO 直通)=====> [本地 RTX 4090]                                 |
-|            |       =====(IO 直通)=======> [本地 NVMe SSD]                                 |
-|            |                                                                              |
-|      (2. 内存分层 - vNUMA 防崩设计)                                                       |
-|      [Guest RAM] --> Node 0 (0-32GB) --> [本地物理内存] (锁定，供显卡/OS使用)             |
-|                  --> Node 1 (32GB+)  --> [DSM 分布式内存池] (存海量冷数据)                |
-|                                                                                           |
-|      (3. 核心调度 - 亲和性锁定)                                                           |
-|      [GiantVM Kernel] ---(vCPU 0 锁定本地)---> [本地 CPU] (消除渲染提交延迟)              |
-|            |                                                                              |
-|      (4. 通信环 - 零拷贝)                                                                 |
-|      [RingBuffer (1GB HugePage)] <===> [QEMU DPDK Backend]                                |
-+------------+-----------------------------------+------------------------------------------+
-             | (UDP: 完整 4KB 页面 / 压缩心跳)     | (TCP: rCUDA 指令流)
-             v                                   v
-    [ 网关节点 (Gateway 1...16) ]          [ rCUDA Client (Guest内) ]
-    (16核 E5, 运行 DPDK)                         |
-    * 职责: MTU 1500 碎片重组 / 心跳聚合           |
-             |                                   |
-             +----------------+------------------+
-             | (UDP: 碎片包)    | (CUDA 计算任务)
-             v                v
-   +--------------------------+           +--------------------------+
-   | [ Slave Node 1 ]         |   ...     | [ Slave Node N ]         |
-   | (运行 Kernel + DPDK)     |           | (运行 Kernel + DPDK)     |
-   | - vCPU 算力池 (vCPU 1~N)  |           | - vCPU 算力池             |
-   | - DSM 内存池 (High Mem)   |           | - DSM 内存池              |
-   | - rCUDA Server (GPU计算) |           | - rCUDA Server (GPU计算) |
-   +------------+-------------+           +-------------+------------+
-                |                                       |
-                +<------- (UDP P2P: 内存页数据交换) ------->+
+|      (1. 核心层 - 极致性能)                                                               |
+|      [QEMU Process] <===(RingBuffer 零拷贝)====> [GiantVM Kernel Module]                  |
+|                                                       |                                   |
+|      (2. 通信层 - 静态槽位池)                           | (UDP: Protocol 4KB Pages)         |
+|      [Static Slots Pool (16 Gateways)] <==============+                                   |
++------------+------------------------------------------------------------------------------+
+             | (物理直连 / 极速局域网)
+             v
+    [ 网关节点 (Gateway 1...16) ] (物理机/VM, 运行 DPDK/Bridge)
+    * 职责: 流量汇聚 / NAT 映射 / MTU 1280 分片适配
+    * 路由表: { Slave_ID -> Tailscale_IP : Port }
+             |
+             +-----------------------------------------------------------+
+             | (Tailscale VPN Mesh / 公网隧道 / MTU 1280)                 |
+             v                                                           v
+   +----------------------------------+          +----------------------------------+
+   | [ Slave Container 1 ] (廉价算力)  |   ...    | [ Slave Container N ] (廉价算力)  |
+   | (Ubuntu 20/22, 无内核权限)        |          | (Ubuntu 20/22, 无内核权限)        |
+   |                                  |          |                                  |
+   |  [ gvm_slave_daemon (User) ]     |          |  [ gvm_slave_daemon (User) ]     |
+   |      ^                           |          |      ^                           |
+   |      | (liburing 异步IO)          |          |      | (liburing 异步IO)         |
+   |  [ Memory Pool (malloc) ]        |          |  [ Memory Pool (malloc) ]        |
+   |                                  |          |                                  |
+   |  (Heartbeat -> Gateway)          |          |  (Heartbeat -> Gateway)          |
+   +----------------------------------+          +----------------------------------+
 ```
 
 #### 2. 核心模块实现逻辑详解
@@ -92,47 +87,65 @@
 这是**强制性**的工程结构。每一个文件都有其存在的物理意义，**不能删减**。
 
 ```text
-GiantVM-Frontier-Pure/
-├── kernel_module/                  # [Kernel 5.4] 核心模块 (Master/Slave 通用)
-│   ├── Kbuild
-│   ├── giantvm_main.c              # [入口] 模块加载，Slab Cache 初始化 (防栈溢出)，strict_hpc 参数
-│   ├── giantvm.h                   # [头文件] 核心结构体定义 (Packed对齐，统一协议头)
-│   ├── consistency/
-│   │   ├── ivy.c                   # [核心协议] 混合一致性逻辑 + Atomic Timeout (防死锁)
-│   │   ├── prefix_scanner.c        # [极简] 扫描指令前缀 (0xF0/0x87)，判断强/弱一致
-│   │   ├── barrier_trap.c          # [安全] 拦截 MFENCE 指令 (可配置开启)
-│   │   └── rip_cache.c             # [优化] RIP 属性缓存哈希表
-│   ├── scheduler/
-│   │   └── affinity.c              # [关键] vCPU 0 本地锁定逻辑 (sched_setaffinity)
-│   ├── memory/
-│   │   ├── mmu_notifier.c          # [适配] Linux 5.4 页表钩子
-│   │   └── page_state.c            # [状态机] Exclusive/Shared 状态管理
-│   └── transport/
-│       └── net_bridge.c            # [通信] 1GB HugePage RingBuffer (Zero-Copy)
+GiantVM-Frontier-Hybrid/
+├── common_include/                 # [公共] 协议定义源头 (Single Source of Truth)
+│   └── giantvm_protocol.h          # 定义 gvm_msg_header, copyset_t, request_slot
+│                                   # (Master 和 Slave 编译时都指向这里，保证二进制兼容)
 │
-├── gateway_service/                # [Gateway] DPDK 转发程序 (运行在 Gateway 节点)
-│   ├── Makefile
-│   ├── main.c                      # DPDK lcore 轮询主循环
-│   ├── fragment_handler.c          # [核心] 调用 librte_ip_frag 处理 MTU 1500 重组 + TTL GC
-│   └── aggregator.c                # [卸载] 心跳位图聚合 (Bitmap Compression)
+├── kernel_module/                  # [Master] 核心模块 (Linux 5.4, 物理机)
+│   ├── Kbuild                      # 内核构建脚本
+│   ├── giantvm_main.c              # 模块入口 (insmod), 资源申请, Sysfs 接口
+│   ├── giantvm_core.h              # 内核专用头文件 (引用 common_include)
+│   ├── consistency/                # [一致性层]
+│   │   ├── ivy.c                   # 混合一致性主逻辑
+│   │   ├── barrier_trap.c          # [HPC] MFENCE 拦截与强一致性保障
+│   │   └── page_state.c            # 页面状态机 (SHARED/EXCLUSIVE)
+│   ├── transport/                  # [通信层]
+│   │   ├── static_slots.c          # [关键] 静态槽位池管理 (O(1) 唤醒)
+│   │   ├── gateway_link.c          # 网关连接抽象与哈希路由
+│   │   └── udp_backend.c           # 内核 UDP 收发与重传逻辑
+│   ├── scheduler/                  # [调度层]
+│   │   └── affinity.c              # [Game] vCPU 0 物理核锁定逻辑 (防微卡顿)
+│   └── utils/                      # [工具层]
+│       └── ring_buffer.c           # 内核与 QEMU 通信的环形缓冲实现
 │
-├── qemu-5.2.0-patch/               # [QEMU] 源码补丁 (运行在 Master/Slave)
-│   ├── net/
-│   │   └── gvm_dpdk.c              # [网络] DPDK 初始化，P2P 数据面逻辑
-│   ├── hw/vfio/
-│   │   └── dsm_numa_filter.c       # [关键] 修改 VFIO Listener，强制忽略 Node 1 (防OOM)
+├── userspace_slave/                # [Slave] 算力节点守护进程 (Ubuntu 20/22 容器)
+│   ├── CMakeLists.txt              # 构建脚本 (需检测 liburing)
+│   ├── src/
+│   │   ├── main.c                  # 进程入口, 参数解析, 内存池 mmap
+│   │   ├── net_engine_uring.c      # [核心] io_uring 异步 I/O 引擎 (SQ/CQ 处理)
+│   │   ├── protocol_handler.c      # 协议解析与逻辑分发 (读/写内存)
+│   │   └── heartbeat.c             # [NAT] 定时向 Gateway 发送 REGISTER 包
 │   ├── include/
-│   │   └── gvm_proto.h             # [协议] GVM-UDP 协议头定义
-│   └── util/
-│       └── main_loop.c             # [修复] select() 替换为 poll()
+│   │   └── slave_context.h         # 本地上下文结构定义
+│   └── utils/
+│       └── cmd_parser.c            # 解析命令行 (GateWay IP, Port, RamSize)
 │
-├── guest_tools/                    # [Guest] Windows 工具 (非驱动)
-│   └── memory_hint.c               # [安全] 用户态程序，通过申请内存占位 Node 1，迫使游戏使用 Node 0
+├── gateway_service/                # [Gateway] 流量汇聚与 NAT 网关
+│   ├── Makefile                    # DPDK 构建脚本
+│   ├── src/
+│   │   ├── main.c                  # DPDK EAL 初始化与 lcore 循环
+│   │   ├── nat_table.c             # [NAT] 简单的 Hash Map 实现 (SlaveID -> TailscaleIP)
+│   │   ├── packet_forward.c        # 查表转发逻辑
+│   │   └── frag_adapter.c          # [MTU] 1500 -> 1280 分片处理逻辑
+│   └── include/
+│       └── gateway_config.h
 │
-└── deploy/
-    ├── cluster_config.json         # 拓扑配置文件
-    ├── launch_master.sh            # Master 启动脚本 (配置 -numa, -device vfio, -cpu hv_relaxed)
-    └── launch_slave.sh             # Slave 启动脚本 (配置 rCUDA Daemon)
+├── qemu-5.2.0-patch/               # [Master] QEMU 源码补丁
+│   ├── hw/vfio/dsm_numa_filter.c   # VFIO 过滤 (防 OOM)
+│   └── net/gvm_backend.c           # 接入 RingBuffer 的后端实现
+│
+├── guest_tools/                    # [Guest] Windows 优化工具
+│   └── memory_hint.c               # 内存占位 (VirtualAllocExNuma)
+│
+└── deploy/                         # 自动化部署脚本
+    ├── cluster_config.json         # 全局拓扑配置
+    ├── master/
+    │   ├── setup_network.sh        # sysctl 调优 (rmem_max, bbr)
+    │   └── launch_master.sh        # 加载 ko, 启动 QEMU
+    └── slave/
+        ├── install_deps.sh         # apt install liburing-dev tailscale
+        └── launch_container.sh     # 启动 userspace_slave (绑定 tailscale IP)
 ```
 
 ---
@@ -180,11 +193,11 @@ GiantVM-Frontier-Pure/
 2.  **稳定性基石 (Legacy Fixes)**：
     -   **Slab Cache**：大型结构体必须用 `kmem_cache_alloc`，**严禁**内核栈分配。
     -   **Atomic Timeout**：自旋锁/关中断等待中，必须使用 `touch_nmi_watchdog()`。实现超时计数器（Gaming 50ms, HPC 5s），超时返回 `-EIO`，**严禁死锁**。
-3.  **通信可靠性 (UDP Stop-and-Wait)**：
-    -   **机制**：鉴于底层 UDP (Fire-and-Forget) 特性，必须在内核层实现基础的**丢包重传**。
-    -   **逻辑**：发送请求 -> 记录 `ktime_get()` -> 轮询 RingBuffer 回包。
-    -   **超时重传**：如果在 **2ms** 内未收到响应，视为物理链路丢包，**立即重传**原请求（保持原 `req_id`）。
-    -   **熔断**：最大重传 **5次**。若仍无回包，说明目标节点或网关宕机，返回 `-EIO` 错误。
+3.  **通信并发与可靠性 (Reliable UDP via Static Slots)**：
+    -   **并发机制**：废弃低效的全局锁停等模式。采用 **Static Slot (静态槽位/票据)** 机制。
+    -   **逻辑**：vCPU 申请 Slot -> 发送请求 -> 挂起当前 vCPU (Sleep on `slot->wq`) -> 接收端中断触发 `wake_up` -> vCPU 被唤醒读取数据。
+    -   **超时重传**：若 Slot 在 **2ms** 内状态未变为 `DONE`，视为丢包，**立即重传**（保持原 `req_id` 和 `slot_idx`）。
+    -   **流控**：利用 Slot 池的大小（256个/Gateway）作为天然的滑动窗口。若 Slot 耗尽，发送方自动阻塞，实现背压 (Backpressure)。
 4.  **通信层与调度**：
     -   **RingBuffer**：`net_bridge.c` 实现 1GB HugePage IVSHMEM 零拷贝环形缓冲。
     -   **亲和性**：硬编码将 **vCPU 0** 锁定在 Master 物理核。
@@ -207,101 +220,133 @@ GiantVM-Frontier-Pure/
 # 强制性目录结构 (Strict Enforcement)
 (你必须严格遵守以下目录结构，不得擅自修改文件名或路径。注意：没有 `dsm_backend`，没有 `fast_mem_server`)
 
-GiantVM-Frontier-Pure/
-├── kernel_module/                  # [Kernel 5.4] 核心模块
-│   ├── Kbuild
-│   ├── giantvm_main.c              # 入口，Slab Cache 初始化，strict_hpc 参数
-│   ├── giantvm.h                   # 核心结构体 (Packed), RingBuffer 定义
-│   ├── consistency/
-│   │   ├── ivy.c                   # 协议核心 (Scope Filter, Barrier Trap, Timeout Logic)
-│   │   ├── prefix_scanner.c        # [Safe] probe_kernel_read 3 bytes
-│   │   ├── barrier_trap.c          # MFENCE 拦截逻辑
-│   │   └── rip_cache.c             # RIP 属性缓存
-│   ├── scheduler/
-│   │   └── affinity.c              # vCPU 0 物理核锁定
-│   ├── memory/
-│   │   ├── mmu_notifier.c          # 5.4 页表钩子
-│   │   └── page_state.c            # 状态机
-│   └── transport/
-│       └── net_bridge.c            # 1GB RingBuffer (Zero-Copy)
+GiantVM-Frontier-Hybrid/
+├── common_include/                 # [公共] 协议定义源头 (Single Source of Truth)
+│   └── giantvm_protocol.h          # 定义 gvm_msg_header, copyset_t, request_slot
+│                                   # (Master 和 Slave 编译时都指向这里，保证二进制兼容)
 │
-├── gateway_service/                # [Gateway] DPDK 20.11 转发网关
-│   ├── Makefile
-│   ├── main.c                      # Lcore 轮询
-│   ├── fragment_handler.c          # librte_ip_frag Wrapper + TTL GC
-│   └── aggregator.c                # 心跳聚合
+├── kernel_module/                  # [Master] 核心模块 (Linux 5.4, 物理机)
+│   ├── Kbuild                      # 内核构建脚本
+│   ├── giantvm_main.c              # 模块入口 (insmod), 资源申请, Sysfs 接口
+│   ├── giantvm_core.h              # 内核专用头文件 (引用 common_include)
+│   ├── consistency/                # [一致性层]
+│   │   ├── ivy.c                   # 混合一致性主逻辑
+│   │   ├── barrier_trap.c          # [HPC] MFENCE 拦截与强一致性保障
+│   │   └── page_state.c            # 页面状态机 (SHARED/EXCLUSIVE)
+│   ├── transport/                  # [通信层]
+│   │   ├── static_slots.c          # [关键] 静态槽位池管理 (O(1) 唤醒)
+│   │   ├── gateway_link.c          # 网关连接抽象与哈希路由
+│   │   └── udp_backend.c           # 内核 UDP 收发与重传逻辑
+│   ├── scheduler/                  # [调度层]
+│   │   └── affinity.c              # [Game] vCPU 0 物理核锁定逻辑 (防微卡顿)
+│   └── utils/                      # [工具层]
+│       └── ring_buffer.c           # 内核与 QEMU 通信的环形缓冲实现
 │
-├── qemu-5.2.0-patch/               # [QEMU 5.2] 补丁
-│   ├── net/
-│   │   └── gvm_dpdk.c              # DPDK 初始化
-│   ├── hw/vfio/
-│   │   └── dsm_numa_filter.c       # vNUMA 过滤 (只锁 Node 0)
+├── userspace_slave/                # [Slave] 算力节点守护进程 (Ubuntu 20/22 容器)
+│   ├── CMakeLists.txt              # 构建脚本 (需检测 liburing)
+│   ├── src/
+│   │   ├── main.c                  # 进程入口, 参数解析, 内存池 mmap
+│   │   ├── net_engine_uring.c      # [核心] io_uring 异步 I/O 引擎 (SQ/CQ 处理)
+│   │   ├── protocol_handler.c      # 协议解析与逻辑分发 (读/写内存)
+│   │   └── heartbeat.c             # [NAT] 定时向 Gateway 发送 REGISTER 包
 │   ├── include/
-│   │   └── gvm_proto.h             # 协议头
-│   └── util/
-│       └── main_loop.c             # poll() 替换 select()
+│   │   └── slave_context.h         # 本地上下文结构定义
+│   └── utils/
+│       └── cmd_parser.c            # 解析命令行 (GateWay IP, Port, RamSize)
 │
-├── guest_tools/                    # [Guest] Windows 工具
-│   └── memory_hint.c               # 用户态内存占位工具 (VirtualAllocExNuma)
+├── gateway_service/                # [Gateway] 流量汇聚与 NAT 网关
+│   ├── Makefile                    # DPDK 构建脚本
+│   ├── src/
+│   │   ├── main.c                  # DPDK EAL 初始化与 lcore 循环
+│   │   ├── nat_table.c             # [NAT] 简单的 Hash Map 实现 (SlaveID -> TailscaleIP)
+│   │   ├── packet_forward.c        # 查表转发逻辑
+│   │   └── frag_adapter.c          # [MTU] 1500 -> 1280 分片处理逻辑
+│   └── include/
+│       └── gateway_config.h
 │
-└── deploy/
-    ├── cluster_config.json
-    ├── launch_master.sh            # 启动参数: -numa, -device vfio, -cpu hv_relaxed
-    └── launch_slave.sh             # 启动参数: rCUDA Daemon
+├── qemu-5.2.0-patch/               # [Master] QEMU 源码补丁
+│   ├── hw/vfio/dsm_numa_filter.c   # VFIO 过滤 (防 OOM)
+│   └── net/gvm_backend.c           # 接入 RingBuffer 的后端实现
+│
+├── guest_tools/                    # [Guest] Windows 优化工具
+│   └── memory_hint.c               # 内存占位 (VirtualAllocExNuma)
+│
+└── deploy/                         # 自动化部署脚本
+    ├── cluster_config.json         # 全局拓扑配置
+    ├── master/
+    │   ├── setup_network.sh        # sysctl 调优 (rmem_max, bbr)
+    │   └── launch_master.sh        # 加载 ko, 启动 QEMU
+    └── slave/
+        ├── install_deps.sh         # apt install liburing-dev tailscale
+        └── launch_container.sh     # 启动 userspace_slave (绑定 tailscale IP)
 
 # 任务指令 (The Task)
+**项目背景**: 
+我们需要构建 GiantVM "Frontier-X" 混合云版本。Master 运行在物理机内核态以保证极致性能，Slave 运行在廉价容器(无内核权限)中以降低成本。中间通过 Gateway 和 Tailscale 网络连接。
 我们将采用**增量开发模式**。请**仅执行 Step 1**，但我需要你知晓后续步骤以便设计接口。
 
-**Step 1: 基础设施与静态槽位通信架构 (Infrastructure & Static Slots)**
+**Step 1: 基础设施与混合云架构 (Infrastructure & Hybrid Architecture)**
 
 **Directory Check**: 确认目录结构。
 
 **Architecture Constraints (CRITICAL):**
 1.  **Topology**: Master 逻辑上连接 10,240 个 Slave，但物理上仅与 **16 个 Gateway** 建立 UDP 连接。
-2.  **Memory**: **严禁**为 10,240 个节点分配接收缓冲区。所有通信资源必须基于 **Gateway Connection** 进行池化管理 (Static Slots)。
-3.  **Alloc**: 通信热路径 (Hot Path) **严禁**使用 `kmalloc/kfree`，必须使用预分配内存。
+2.  **Memory Model**: Master 端必须遵循 **Static Slot Architecture**。**严禁**为 10,240 个 Slave 分配接收缓冲区，必须基于 16 个 Gateway 连接进行池化管理 (Memory Pool)。
+3.  **Hybrid Compatibility**: Master 运行 Kernel Module；Slave 运行 Userspace Daemon (`io_uring`)。两者必须遵循完全一致的二进制协议头。
+4.  **Network MTU**: 考虑到 Tailscale/VPN 环境，Gateway 和 Slave 必须能够处理 **MTU 1280** 场景下的分片与重组。
 
 **具体文件任务 (File Specifications):**
 
-1.  **`kernel_module/giantvm.h`**:
+1.  **`kernel_module/giantvm.h`** (Shared Protocol Header):
     -   **Copyset**: 定义 `copyset_t` 结构，包含 `unsigned long bits[BITS_TO_LONGS(10240)]`。
-    -   **GVM Header**: 定义 `struct gvm_msg_header` (Packed)，必须包含：
-        -   `uint64_t req_id`: 全局唯一流水号 (防止脏数据)。
-        -   `uint32_t msg_type`: 消息类型 (READ/WRITE/INVALIDATE/ACK)。
-        -   `uint16_t slot_idx`: 静态槽位下标 (实现 O(1) 唤醒)。
+    -   **GVM Header**: 定义 `struct gvm_msg_header` (**__attribute__((packed))**)，必须包含：
+        -   `uint64_t req_id`: 全局唯一流水号 (防止脏数据/重放)。
+        -   `uint32_t msg_type`: 消息类型 (READ/WRITE/INVALIDATE/ACK/REGISTER/HEARTBEAT)。
+        -   `uint16_t slot_idx`: 静态槽位下标 (实现 Master 端 O(1) 唤醒)。
         -   `uint16_t src_node_id`: 逻辑源节点 ID (0-10239)。
+        -   `uint16_t fragment_idx`: 分片索引 (适配 MTU 1280)。
     -   **Static Slot**: 定义 `struct request_slot`：
         -   `volatile int state` (FREE/PENDING/DONE)。
-        -   `uint64_t req_id` (用于校验回包)。
-        -   `wait_queue_head_t wq` (vCPU 等待队列)。
-        -   `u8 data_buffer[PAGE_SIZE]` (预分配 DMA 缓冲区)。
-    -   **RingBuffer**: 定义 `struct ring_buffer` (Head, Tail, Data) 用于 QEMU-Kernel 通信。
+        -   `uint64_t req_id`; `wait_queue_head_t wq`; 
+        -   `u8 *data_buffer`: 指向预分配 DMA 缓冲区的指针。
+    -   **RingBuffer**: 定义 `struct ring_buffer` (Head, Tail, Size, Data[0]) 用于 QEMU-Kernel 零拷贝通信。
 
-2.  **`kernel_module/transport/net_bridge.c`**:
-    -   **Gateway Context**: 定义 `struct gateway_link`，包含 `struct request_slot slots[256]` 和 `spinlock_t slot_lock` (仅保护位图)。
-    -   **Global Topology**: 定义 `struct gateway_link gateways[16]`。
-    -   **Send Logic (Zero-Alloc)**: 实现 `gvm_send_req`。根据目标 Slave ID 哈希选择 Gateway，使用 `find_first_zero_bit` 申请 Slot，填入 Header 后发送。
-    -   **Receive Logic (O(1))**: 实现中断处理函数 `gvm_rx_handler`：
+2.  **`kernel_module/giantvm_main.c`** (Master Entry):
+    -   初始化 `dsm_resp_cache` (使用 `kmem_cache_create`，防栈溢出)。
+    -   初始化 `gateways` 数组与静态槽位池。
+    -   实现基础的 `udp_retransmit_loop` 占位函数。
+    -   **Safety**: 确保模块卸载时正确释放所有 Slab Cache 和预分配内存。
+
+3.  **`kernel_module/transport/net_bridge.c`** (Master Transport):
+    -   **Gateway Context**: 定义 `struct gateway_link`，包含 `struct request_slot slots[256]` 和 `spinlock_t bitmap_lock`。
+    -   **Zero-Alloc Send**: 实现 `gvm_send_req`。使用 `find_first_zero_bit` 申请 Slot，填入 Header 后发送。**严禁热路径 kmalloc**。
+    -   **O(1) Receive**: 实现中断处理函数 `gvm_rx_handler`：
         -   直接读取包头 `slot_idx` 定位 Slot。
-        -   **Security Check**: 必须验证 `slots[slot_idx].req_id == header.req_id`。如果不一致则丢弃。
-        -   验证通过后，`memcpy` 数据到 `slot->data_buffer` 并唤醒 `slot->wq`。
+        -   **Verify**: 校验 `req_id` 是否匹配。如果不匹配（过期包/脏数据），直接丢弃。
+        -   校验通过后，拷贝数据并 `wake_up`。
 
-3.  **`kernel_module/giantvm_main.c`**:
-    -   模块入口，初始化 `gateways` 数组及其自旋锁。
-    -   初始化 `dsm_resp_cache` (用于 consistency 层的元数据，非通信数据)。
-    -   实现基础的 `udp_retransmit_logic`：检查 Slot 状态，若超时未 DONE 则重发 Slot 中的数据。
+4.  **`userspace_slave/`** (Container Slave - **New!**):
+    -   **Target**: Ubuntu 20.04/22.04 容器，无 Root 权限，无内核模块。
+    -   **Core**: 使用 **`liburing` (io_uring)** 实现高性能异步 I/O。
+    -   **Components**:
+        -   `main.c`: 使用 `malloc` 申请大块内存池 (需保留 512MB 给系统防 OOM)。
+        -   `net_engine.c`: 初始化 io_uring SQ/CQ。循环处理：收包 -> 解析 Header -> 读写内存池 -> 零拷贝回包 (必须保留请求包中的 `slot_idx` 和 `req_id`)。
+        -   `heartbeat.c`: 独立线程，每秒发送 `MSG_TYPE_REGISTER` 到 Gateway，携带自身逻辑 ID。
 
-4.  **`kernel_module/memory/page_state.c`**:
-    -   实现状态机枚举 (SHARED/EXCLUSIVE/INVALID) 及其字符串转换辅助函数。
+5.  **`gateway_service/`** (DPDK/Bridge):
+    -   **NAT Table**: 实现 Hash Map: `Slave_ID -> { Tailscale_IP, Port }`。
+    -   **Logic**: 收到 Slave 的 REGISTER 包更新路由表；收到 Master 数据包查表转发。
+    -   **Frag**: 需注意处理 MTU 1280 (Tailscale) 的分片逻辑。
 
-5.  **`guest_tools/memory_hint.c`**:
-    -   实现 Windows 用户态工具。使用 `VirtualAllocExNuma` 在 Node 1 (远程节点) 申请内存并 Lock 住，迫使游戏只能使用 Node 0。
+6.  **`memory/page_state.c`** & **`guest_tools/memory_hint.c`**:
+    -   保持原有的状态机枚举 (SHARED/EXCLUSIVE) 和 Windows 内存占位工具逻辑。
 
-6.  **`deploy/launch_master.sh`**:
-    -   生成启动脚本。必须包含 `sysctl -w net.core.rmem_max=...` (调大 UDP 缓冲区) 和 GiantVM 相关的 QEMU 启动参数 (-numa, -device vfio)。
+7.  **`deploy/`**:
+    -   `master/launch_master.sh`: 包含 `sysctl` 调优和 Master 启动命令。
+    -   `slave/launch_container.sh`: 启动用户态 Slave 程序的脚本 (绑定 Tailscale IP)。
 
-7.  **`gateway_service/` (DPDK Note)**:
-    -   (仅需知晓) 网关转发逻辑必须**透明透传** `slot_idx` 和 `req_id`，不可修改这两个字段。
+**输出要求**:
+仅生成 Step 1 的代码。请确保 Master 端使用内核风格 (Linux 5.4 API)，Slave 端使用标准 C11 + liburing 风格。两者头文件必须严格对齐。
 
 **Step 2: 混合一致性与传输核心 (Consistency & Transport)** (暂不执行)
 1.  **`kernel_module/consistency/ivy.c`**: 实现 IVY 协议状态流转。
