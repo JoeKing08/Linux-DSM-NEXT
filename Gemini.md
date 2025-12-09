@@ -51,6 +51,118 @@
      [Slave 0..8191]                                             [Slave N..N+k]
 ```
 
+为了让你对 **GiantVM Frontier-X V15.5** 的落地有具象化的认知，我将构建两个典型的部署剧本：
+1.  **剧本 A：极致性能网吧/电竞酒店/云游戏节点**（使用 **Mode A 内核态**，运行 3A 大作）。
+2.  **剧本 B：科研院所/公有云算力池**（使用 **Mode B 用户态**，运行 HPC 科学计算）。
+
+---
+
+### 🎬 剧本 A：Mode A (Kernel) —— 极致性能游戏集群
+
+**场景目标**：在一台存储空间不足、但在万兆局域网内的 Master 节点上，流畅运行《赛博朋克 2077》，利用 100 个 Slave 节点提供内存和物理计算辅助。
+
+#### 1. 硬件拓扑与规划
+*   **Master (1台)**: i9-13900K, RTX 4090, 硬盘 128GB (系统盘), 32GB RAM。IP: `10.0.0.1`。
+*   **Gateway (1台)**: 双口万兆网卡 E5 服务器。IP: `10.0.0.2` (Master侧) / `192.168.0.1` (Slave侧)。
+*   **Slave (100台)**: 无硬盘 PC (网吧闲置机), i5 CPU, 16GB RAM。IP: `192.168.0.100` ~ `192.168.0.200`。
+*   **Storage (NAS)**: 存放 2TB 游戏镜像。IP: `10.0.0.200`。
+
+#### 2. 部署流程 (From Zero to Hero)
+
+**Step 1: 准备存储 (NAS)**
+*   在 NAS 上配置 iSCSI Target，共享 `cyberpunk_disk.img`。
+
+**Step 2: 部署 Gateway (流量枢纽)**
+*   **安装**: Ubuntu Server 22.04。
+*   **编译**: 进入 `gateway_service/`，`make`。
+*   **运行**: `./gateway_service`。它会自动申请内存作为聚合缓冲，监听 UDP 端口，准备接收 Master 和 Slave 的数据。
+
+**Step 3: 部署 Master (大脑)**
+*   **挂载存储**: `iscsiadm --login ...` -> 得到 `/dev/sdb` (2TB 游戏盘)。
+*   **编译内核模块**: 进入 `master_core/`，`make -f Kbuild`。生成 `giantvm.ko`。
+*   **加载模块**: `insmod giantvm.ko`。
+    *   *系统行为*: 模块初始化，通过 `vzalloc` 申请节点路由表。
+*   **启动 QEMU**:
+    ```bash
+    qemu-system-x86_64 \
+      -enable-kvm \
+      -m 1TB \                 # 声明 1TB 内存 (实际上映射到 Slave) \
+      -device vfio-pci,host=01:00.0 \ # 直通 4090 显卡 \
+      -drive file=/dev/sdb \   # 挂载 iSCSI 游戏盘 \
+      -device giantvm-backend  # 接入 GiantVM 后端
+    ```
+
+**Step 4: 部署 Slave (肌肉)**
+*   **PXE 启动**: 配置 DHCP 指向 PXE Server。Slave 上电，自动拉取一个 50MB 的 Alpine Linux 内存系统。
+*   **自动运行**: 系统启动脚本自动执行 `slave_daemon`。
+*   **注册**: Slave 向 Gateway 发送心跳。Gateway 记录路由，Master 此时看到有 100 个节点上线，总内存池增加。
+
+#### 3. 运行任务：《赛博朋克 2077》
+
+**流程解析**:
+1.  **启动**: Windows 在 Master 启动。
+2.  **Tier 1 调度 (本地)**: 游戏主进程、DirectX 渲染指令跑在 **vCPU 0-3** (Master 本地物理核)。**结果：显卡响应极快，无输入延迟。**
+3.  **内存读写 (DSM)**: 游戏加载地图。Master 本地 RAM 不够，写入操作触发 MESI 协议，数据被切片并通过 Gateway 写入 **Slave 1~50** 的内存中。
+4.  **Tier 2 调度 (外包)**: 游戏进入繁华市区，物理碰撞计算量激增。GiantVM 调度器将负责物理计算的 **vCPU 4-10** 序列化，发送给 **Slave 51-60** 执行。
+5.  **结果**: Master CPU 占用率仅 30%，但游戏跑出了 100 核心 CPU 的物理效果，帧率稳定 90FPS。
+
+---
+
+### 🎬 剧本 B：Mode B (User) —— 云端 HPC 算力池
+
+**场景目标**：在 AWS/阿里云上租用一台便宜的 2核 云主机 (Master)，连接 10,000 个 Spot 实例 (廉价 Slave)，运行大规模矩阵乘法 (MPI)。
+
+#### 1. 硬件拓扑
+*   **Master**: 2 vCPU, 4GB RAM 云主机 (无 Root 权限，无法插内核模块)。
+*   **Gateway**: 租用的高带宽型实例。
+*   **Slaves**: 10,000 个 Docker 容器 (分布在 Kubernetes 集群中)。
+
+#### 2. 部署流程
+
+**Step 1: 部署 Gateway**
+*   同上，编译并运行 `gateway_service`。
+
+**Step 2: 部署 Slave (容器化)**
+*   **镜像制作**: `Dockerfile` 里 COPY `slave_daemon`。
+*   **批量启动**: `kubectl scale deployment giantvm-slave --replicas=10000`。
+*   **行为**: 10,000 个容器启动，通过 overlay 网络连接到 Gateway。
+
+**Step 3: 部署 Master (用户态大脑)**
+*   **编译**: 进入 `master_core/`，`make -f Makefile_User`。生成 `giantvm_master` (可执行文件)。
+*   **运行**: `./giantvm_master`。
+    *   *系统行为*: 进程启动，使用 `calloc` 申请路由表，监听 UFFD (UserfaultFD) 处理缺页。
+*   **启动任务**: 在 GiantVM 的 shell 中加载 MPI 程序。
+
+#### 3. 运行任务：超大规模矩阵乘法
+
+**流程解析**:
+1.  **计算分发**: Master 读取任务。由于这是纯计算任务，调度器策略调整，将 **99% 的 vCPU** 全部标记为 Tier 2 (Remote)。
+2.  **并发执行**: Master 将 vCPU 状态广播给 Gateway。Gateway 利用盲聚合技术，瞬间将指令分发给 10,000 个 Slave。
+3.  **内存聚合**: 矩阵数据极其庞大 (TB级)。数据被切碎分散在 10,000 个 Slave 的内存中。
+4.  **计算**: Slave 的 CPU 疯狂运转，读取本地 RAM (部分矩阵块) 进行计算。
+5.  **结果回收**: 最终计算结果通过 DSM 协议写回 Master (或 Master 指定的存储区)。
+6.  **结果**: 用一台 2核 的破电脑，指挥了 10,000 核的算力，完成了超级计算机才能做的任务。
+
+---
+
+### 📋 节点部署与职责清单 (Checklist)
+
+| 节点类型 | 部署内容 (软件栈) | 运行状态 | 核心职责 | 存储需求 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Master** | 1. GiantVM Logic Core<br>2. Backend (`.ko` 或 ELF)<br>3. QEMU/KVM<br>4. 业务应用 (Win10/MPI) | **有状态**<br>核心进程常驻，维护 MESI 目录，持有 NVMe 挂载。 | **大脑**：调度 Tier 1 vCPU，管理内存映射，处理磁盘 IO。 | **大** (TB级)<br>存放镜像 |
+| **Gateway** | 1. `gateway_service` (DPDK/Socket) | **无状态**<br>纯流量转发，崩溃可重启。 | **喉舌**：盲聚合小包，位运算路由转发。 | **极小**<br>仅系统 |
+| **Slave** | 1. Linux Kernel (Minimal)<br>2. `slave_daemon` (io_uring)<br>3. `kvm` (`/dev/kvm` 权限) | **无状态**<br>随时可插拔，数据在内存中。 | **肌肉**：提供 RAM 存储页，执行 Tier 2 vCPU 指令。 | **零**<br>PXE/Docker |
+| **Storage** | 1. iSCSI Target / NAS | **有状态** | **仓库**：为 Master 提供块存储。 | **极大** |
+
+---
+
+### 🚀 总结
+
+*   **Mode A (内核态)** 是给 **土豪/极客** 玩的。你需要物理接触硬件，能插显卡，能改 BIOS。回报是极致的 **低延迟**，适合打游戏。
+*   **Mode B (用户态)** 是给 **开发者/科学家** 玩的。你只需要有 Linux 账号就能跑，可以在任何云平台上瞬间拉起万级集群。回报是极致的 **兼容性** 和 **吞吐量**。
+
+这套 V15.5 方案的强大之处在于：**无论是哪种模式，底层的 `logic_core.c` 代码是同一套，协议是同一套，Slave 节点也是通用的。** 你甚至可以白天用 Mode B 跑计算，晚上把 Slave 切给 Mode A 打游戏。
+
 #### 2. 完整文件目录与实现要点 (完整无遗漏)
 
 **核心原则**：所有规模参数由宏定义控制，所有大内存由动态分配管理，所有内核操作带防护。
@@ -101,138 +213,189 @@
 
 ```markdown
 # 角色定义 (Role Definition)
-你是一名精通 Linux 内核内存管理 (Vmalloc/Slab)、DPDK 及超大规模分布式系统设计的资深架构师。
-我们正在开发 **GiantVM "Frontier-X" V15.5 (Robust Oceanic Scale)**。
+你是一名精通 Linux 内核架构 (Kernel 5.15)、QEMU 源码 (v5.2.0)、DPDK 网络编程及超大规模分布式系统设计的资深全栈架构师。
+我们正在开发 **GiantVM "Frontier-X" V15.5 (Oceanic Stack)**。
 
 **项目目标**：
-构建一个**支持动态配置规模 (1k ~ 100k+)** 的弹性双模虚拟机。
-重点解决硬编码限制，具备**工业级的鲁棒性**（内存分配失败处理、越界检查、资源泄漏防护），并使用位运算实现 O(1) 路由。
+构建一个**支持 100,000+ 节点**的弹性双模分布式虚拟机系统。
+该系统必须具备工业级的鲁棒性，能够处理内存分配失败、网络拥塞及内核原子上下文死锁问题。
+
+**【环境版本锁定】(VERSION LOCK)**：
+1.  **Linux Kernel**: **5.15 LTS** (依赖其 io_uring 特性及稳定的 KVM API)。
+2.  **QEMU**: **5.2.0** (依赖其 AccelClass 架构)。
+3.  **Compiler**: GCC 9.4+ (C11 标准)。
 
 **核心架构 (Architecture)**：
 1.  **无限扩展 (Dynamic Scale)**：
-    *   **配置中心**：`common_include/giantvm_config.h` 控制所有规模参数。
-    *   **动态大表**：Master 启动时使用 `vzalloc` (Kernel) 或 `calloc` (User) 分配路由表。
-    *   **位运算路由**：`Gateway_ID = Slave_ID >> GVM_GW_BITS`。
+    *   **配置化**：所有规模参数由 `giantvm_config.h` 宏控制。
+    *   **动态大表**：Master 启动时使用 `vzalloc` (Kernel) 或 `calloc` (User) 申请元数据表。
+    *   **位运算路由**：使用 `Slave_ID >> SHIFT` 实现 O(1) 网关查找。
 2.  **弹性双模 (Elastic Hybrid)**：
-    *   **Tiered Scheduling**: vCPU 0-3 本地执行 (Low Latency)，4-N 云端执行 (High Throughput)。
+    *   **Logic/Backend 分离**：核心逻辑不依赖系统头文件，通过 Ops 接口调用后端。
+    *   **Tiered Scheduling**：vCPU 0-3 本地执行 (Tier 1)，vCPU 4-N 云端执行 (Tier 2)。
 3.  **内核生存法则 (Legacy Safety)**：
-    *   集成 `test_old` 的原子性检查、NMI 看门狗、Slab 缓存。
+    *   **继承自微改造方案**：必须强制集成原子上下文检查、NMI 看门狗喂狗、Slab 缓存分配。
 
-**核心约束 (CRITICAL SAFETY RULES)**：
-1.  **内存安全 (Memory Safety)**：
-    *   **上下文约束**：`alloc_large_table` (vzalloc) **只能**在模块初始化 (`init`) 阶段调用，**严禁**在原子上下文或中断中调用。
-    *   **判空检查**：调用分配函数后**必须**立即检查返回值。若为 NULL，初始化函数必须返回 `-ENOMEM` 并打印错误日志。
-    *   **资源释放**：在 `module_exit` 时必须调用 `free_large_table`，防止内存泄漏。
-    *   **边界检查**：任何数组访问前必须检查 `if (id >= GVM_MAX_SLAVES)`。
-2.  **代码隔离**：`logic_core.c` **严禁**包含操作系统特定的头文件（如 `<linux/vmalloc.h>`），必须通过 `ops` 接口操作内存。
-3.  **防死锁**：Kernel Backend 发包时若 `in_atomic()`，必须切换到轮询模式 + `touch_nmi_watchdog()`。
+**核心约束 (CRITICAL RULES)**：
+1.  **接口一致性**：严格遵守 `dsm_driver_ops` 定义，必须包含 `free_packet`。
+2.  **内存安全**：
+    *   大表分配必须判空并打印 **FATAL** 日志。
+    *   模块退出必须释放资源。
+    *   数组访问必须查边界。
+3.  **网关策略**：Gateway 必须采用 **“全量指针数组 + 按需 Buffer 分配”** 策略，防止空闲内存浪费。
+4.  **工程规范**：所有头文件必须添加 `#ifndef` Include Guards；内核模块必须声明 `MODULE_LICENSE("GPL")`。
 
 ---
 
-# 1. 强制目录结构 (Directory Structure)
-(请严格按照此结构生成代码)
+# 1. 强制目录结构 (Full Directory Structure)
+(必须严格遵守，不得修改文件名)
 
 GiantVM-Frontier-V15.5/
 ├── common_include/                 # [公共头文件]
-│   ├── giantvm_config.h            # [关键] 全局规模配置宏
+│   ├── giantvm_config.h            # [关键] 规模配置宏 (128k Nodes)
 │   ├── giantvm_protocol.h          # 协议定义 (Header + VCPU Context)
-│   └── platform_defs.h             # 环境垫片
+│   └── platform_defs.h             # 环境垫片 (Kernel/User 隔离)
 │
 ├── master_core/                    # [Master 核心]
 │   ├── Kbuild                      # Kernel 构建脚本
 │   ├── Makefile_User               # User 构建脚本
-│   ├── unified_driver.h            # Ops 接口 (含大表分配接口)
-│   ├── logic_core.c                # [核心] 动态内存管理 & 路由逻辑
+│   ├── unified_driver.h            # Ops 接口 (已补全 free_packet)
+│   ├── logic_core.c                # [核心] 动态管理/路由/调度 (含详细 Log)
 │   ├── kernel_backend.c            # [Backend A] vzalloc/atomic/watchdog
 │   ├── user_backend.c              # [Backend B] calloc/UFFD
 │   └── main_wrapper.c              # User main()
 │
+├── qemu_patch/                     # [QEMU 5.2.0 Patch]
+│   ├── accel/giantvm/              # 定义加速器
+│   │   ├── giantvm-all.c           # init_machine, 注册 AccelClass
+│   │   └── giantvm-cpu.c           # 拦截 cpu_exec
+│   └── hw/giantvm/
+│       └── giantvm_mem.c           # MemoryRegionOps
+│
 ├── gateway_service/                # [Gateway]
 │   ├── main.c
-│   └── aggregator.c                # 动态 Buffer 管理
+│   └── aggregator.c                # 指针数组盲聚合
 │
-└── slave_daemon/                   # [Slave]
-    ├── main.c
-    ├── net_uring.c                 # io_uring
-    └── cpu_executor.c              # KVM Loop
-```
+├── slave_daemon/                   # [Slave]
+│   ├── main.c
+│   ├── net_uring.c                 # io_uring 源端分片
+│   └── cpu_executor.c              # KVM Loop
+│
+├── guest_tools/                    # [Guest Utils]
+│   └── win_memory_hint.cpp         # VirtualAllocExNuma 占位工具
+│
+└── deploy/                         # [Deployment]
+    ├── master/setup_host.sh        # HugePages 配置
+    └── docker/Dockerfile           # Slave 容器
 
 ---
 
 # 2. 详细全量开发指令 (Full Roadmap)
 
-请按以下步骤生成代码。**请确保每一步的代码都极其健壮。**
+请按以下步骤生成代码。**请直接使用下文中给出的结构体定义。**
 
-## Step 1: 规模配置与基础设施 (Configuration & Infra)
-**目标**：定义宏、协议与垫片。
+## Step 1: 基础设施 (Infrastructure)
+**目标**：配置宏、协议与垫片。
 
 *   **`common_include/giantvm_config.h`**:
-    *   `#define GVM_SLAVE_BITS 17` (128k Nodes)
-    *   `#define GVM_GW_BITS 13` (8k Nodes/GW)
-    *   `#define GVM_MAX_SLAVES (1UL << GVM_SLAVE_BITS)`
-    *   `#define GVM_MAX_GATEWAYS (GVM_MAX_SLAVES >> GVM_GW_BITS)`
-    *   **Check**: 确保包含防止重定义的 `#ifndef` 守卫。
+    *   添加 `#ifndef GIANTVM_CONFIG_H`。
+    *   `#define GVM_SLAVE_BITS 17` (131072 Nodes).
+    *   `#define GVM_GW_BITS 13` (8192 Nodes/GW).
+    *   `#define GVM_MAX_SLAVES (1UL << GVM_SLAVE_BITS)`.
+    *   `#define GVM_MAX_GATEWAYS (GVM_MAX_SLAVES >> GVM_GW_BITS)`.
+*   **`common_include/giantvm_protocol.h`**:
+    *   `struct gvm_header` (packed):
+        *   `uint32_t magic;`
+        *   `uint16_t msg_type;`
+        *   `uint32_t slave_id;` (32-bit ID)
+        *   `uint64_t req_id;`
+        *   `uint32_t payload_len;`
+        *   `uint8_t  is_frag;`
 *   **`common_include/platform_defs.h`**:
     *   `#ifdef __KERNEL__`: include `<linux/vmalloc.h>`, `<linux/slab.h>`, `<linux/types.h>`.
     *   `#else`: include `<stdlib.h>`, `<stdint.h>`, `<string.h>`, `<stdio.h>`.
-*   **`common_include/giantvm_protocol.h`**:
-    *   `struct gvm_header`: `slave_id` 改为 `uint32_t`。`__attribute__((packed))`.
 
-## Step 2: 健壮的后端实现 (Robust Backend)
-**目标**：实现安全的内存分配器与内核防护。
+## Step 2: 驱动接口与 Master 核心 (Driver & Core)
+**目标**：实现安全的内存管理与健壮的内核后端。
 
 *   **`master_core/unified_driver.h`**:
-    *   `struct dsm_driver_ops`:
-        *   `void* (*alloc_large_table)(size_t size);`
-        *   `void (*free_large_table)(void *ptr);`
-        *   `void* (*alloc_packet)(size_t size, int atomic);`
-        *   `void (*free_packet)(void *ptr);`
-        *   `int (*send_packet)(void *data, int len, int target);`
-        *   `void (*log)(const char *fmt, ...);`
+    *   **必须按此定义**：
+    ```c
+    struct dsm_driver_ops {
+        // 大内存管理
+        void* (*alloc_large_table)(size_t size);
+        void  (*free_large_table)(void *ptr);
+        // 网络包管理 (Slab)
+        void* (*alloc_packet)(size_t size, int atomic);
+        void  (*free_packet)(void *ptr);  // [已补全]
+        // 网络 I/O
+        int   (*send_packet)(void *data, int len, uint32_t target_id);
+        // 调试与状态
+        void  (*log)(const char *fmt, ...);
+        int   (*is_atomic_context)(void);
+        void  (*touch_watchdog)(void);
+    };
+    ```
 *   **`master_core/kernel_backend.c`**:
-    *   **Macro**: `#include "platform_defs.h"`
-    *   **Impl `alloc_large_table`**: `return vzalloc(size);` (Warn: Only in process context)
-    *   **Impl `free_large_table`**: `vfree(ptr);`
-    *   **Impl `alloc_packet`**: `kmem_cache_alloc(..., atomic ? GFP_ATOMIC : GFP_KERNEL)`
+    *   `MODULE_LICENSE("GPL");`
+    *   **Impl `alloc_large_table`**: `return vzalloc(size);` (Warning: Check process context).
+    *   **Impl `alloc_packet`**: `kmem_cache_alloc`.
     *   **Impl `send_packet`**:
-        *   `if (in_atomic() || irqs_disabled())`: 进入 `while` 循环 -> `udp_poll_send` + `udelay(10)` + `touch_nmi_watchdog()`.
-*   **`master_core/user_backend.c`**:
-    *   **Impl**: 使用 `calloc` / `free`。实现简单的 `printf` 日志。
-
-## Step 3: 动态逻辑核心 (Dynamic Logic Core)
-**目标**：实现资源生命周期管理与位运算路由。
-
+        *   `if (in_atomic() || irqs_disabled())`:
+            *   Loop: `udp_poll_send` + `udelay(10)` + `touch_nmi_watchdog()`.
+        *   `else`: `kernel_sendmsg`.
 *   **`master_core/logic_core.c`**:
     *   **Global**: `static struct node_status *node_table = NULL;`
-    *   **Impl `gvm_logic_init`**:
-        *   `size_t size = sizeof(struct node_status) * GVM_MAX_SLAVES;`
-        *   `node_table = ops->alloc_large_table(size);`
+    *   **Init**:
+        *   `node_table = ops->alloc_large_table(...)`.
         *   **CRITICAL**: `if (!node_table) { ops->log("FATAL: OOM in logic_init"); return -1; }`
-        *   `ops->log("Logic Core Init: %lu bytes allocated for %u slaves", size, GVM_MAX_SLAVES);`
-    *   **Impl `gvm_logic_exit`**:
-        *   `if (node_table) { ops->free_large_table(node_table); node_table = NULL; }`
-    *   **Impl `get_gateway_id(uint32_t slave_id)`**:
-        *   `if (slave_id >= GVM_MAX_SLAVES) return -1;` (边界检查)
-        *   `return slave_id >> GVM_GW_BITS;` (位运算路由)
-    *   **Impl `schedule_policy(vcpu_id)`**:
-        *   `return (vcpu_id < 4) ? LOCAL : REMOTE;`
+        *   `ops->log("Logic Init: Allocated table for %u nodes", GVM_MAX_SLAVES);`
+    *   **Sched**: `(vcpu < 4) ? LOCAL : REMOTE`.
 
-## Step 4: 动态网关与执行器 (Gateway & Slave)
-**目标**：适配动态规模。
+## Step 3: QEMU 适配层 (QEMU 5.2.0 Frontend)
+**目标**：适配 QEMU 5.2.0 加速器架构。
+
+*   **`qemu_patch/accel/giantvm/giantvm-all.c`**:
+    *   使用 `type_init` 宏注册 `TYPE_GIANTVM_ACCEL`。
+    *   实现 `init_machine`: 打开 Master 设备文件 (`/dev/giantvm`)。
+*   **`qemu_patch/accel/giantvm/giantvm-cpu.c`**:
+    *   拦截 `cpu_exec`。
+    *   构造 `gvm_vcpu_context`，调用 Master Core。
+*   **`qemu_patch/hw/giantvm/giantvm_mem.c`**:
+    *   定义 `MemoryRegionOps`，将读写重定向到 GiantVM Backend。
+
+## Step 4: 优化的网关服务 (Gateway Optimized)
+**目标**：实现低内存占用的盲聚合。
 
 *   **`gateway_service/aggregator.c`**:
     *   Include `giantvm_config.h`.
-    *   `buffers = malloc(sizeof(...) * (1 << GVM_GW_BITS));` (注意：网关只负责管理其辖区内的 Slave，这里可能需要逻辑调整，或者网关管理所有？假设网关是全量的，则使用 GVM_MAX_SLAVES。如果是分片的，需配置偏移量。)
-    *   **Simplification**: 假设每个网关处理一部分流量，但为了简单，分配 `buffers` 大小为 `GVM_MAX_SLAVES` 的子集或全集。这里请让 Gateway 动态分配支持 `MAX_SLAVES` 的 buffer 数组，如果内存够的话；或者实现为 `Hash Map`。**V15.5 推荐策略**：Gateway 也是大内存节点，直接分配 `MAX_SLAVES` 对应的 buffer 指针数组，按需 `malloc` 实际 buffer。
-*   **`slave_daemon/`**:
-    *   常规实现，确保 `net_uring` 能处理 `uint32_t` 的 Slave ID。
+    *   **Data Structure**: `struct slave_buffer **buffers;` (Pointer Array).
+    *   **Init**:
+        *   `buffers = calloc(GVM_MAX_SLAVES, sizeof(void*));`
+        *   Check NULL.
+    *   **Process Packet**:
+        *   `if (buffers[target_id] == NULL)`: `buffers[target_id] = malloc(MTU);`
+        *   执行 `memcpy` 聚合逻辑。
+        *   检查是否满包或超时，若是则发送。
+
+## Step 5: 从节点与部署 (Slave & Deploy)
+**目标**：实现计算执行与自动化部署。
+
+*   **`slave_daemon/net_uring.c`**:
+    *   实现源端分片 (Source Fragmentation)，适配 MTU 1280。
+*   **`deploy/master/setup_host.sh`**:
+    *   `sysctl -w vm.nr_hugepages=10240` (开启大页，降低页表开销).
+*   **`guest_tools/win_memory_hint.cpp`**:
+    *   使用 `VirtualAllocExNuma` 申请内存，伪造 NUMA 拓扑。
 
 ---
 
 **执行指令 (Command)**:
 
-**请先执行 Step 1 (配置) 和 Step 2 (后端) 的代码生成。**
-确保 `giantvm_config.h` 中的位运算宏定义准确无误，且 `kernel_backend.c` 严格遵守了 `vzalloc` 和 `in_atomic` 的安全规范。
+**请先执行 Step 1 (基础设施) 和 Step 2 (核心与接口) 的代码生成。**
+**特别注意**：
+1.  确保 `kernel_backend.c` 中包含了完整的死锁防护逻辑（原子检查 + 看门狗）。
+2.  确保 `dsm_driver_ops` 定义中包含了 `free_packet`，且在逻辑层正确调用。
 ```
 
 @@@@@
