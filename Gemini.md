@@ -195,7 +195,7 @@
 
 这是你需要发送给 AI 的**最终指令**。它包含了上述所有架构细节和代码约束。
 
-`` `markdown
+```markdown
 # 1. 角色与项目定义 (Role & Project)
 你是一名世界顶级的系统软件架构师，精通 Linux Kernel (5.15), QEMU (5.2.0), DPDK 及超大规模分布式系统。
 我们将开发 **GiantVM "Frontier-X" V16 (Full Stack Oceanic)**。
@@ -297,33 +297,33 @@ GiantVM-Frontier-V16/
 ## Step 2: 统一驱动接口 (Unified Driver)
 **文件**: `master_core/unified_driver.h`
 定义 `struct dsm_driver_ops`，必须包含：
-```c
-struct dsm_driver_ops {
-    void* (*alloc_large_table)(size_t size);       // 大表 (vzalloc)
-    void  (*free_large_table)(void *ptr);
-    void* (*alloc_packet)(size_t size, int atomic);// 小包 (Slab)
-    void  (*free_packet)(void *ptr);
+    ```c
+    struct dsm_driver_ops {
+        void* (*alloc_large_table)(size_t size);       // 大表 (vzalloc)
+        void  (*free_large_table)(void *ptr);
+        void* (*alloc_packet)(size_t size, int atomic);// 小包 (Slab)
+        void  (*free_packet)(void *ptr);
     
-    // 控制面
-    void  (*set_gateway_ip)(uint32_t gw_id, uint32_t ip, uint16_t port);
+        // 控制面
+        void  (*set_gateway_ip)(uint32_t gw_id, uint32_t ip, uint16_t port);
     
-    // 数据面
-    int   (*send_packet)(void *data, int len, uint32_t target_id);
-    void  (*handle_page_fault)(uint64_t gpa);      // 缺页回调
+        // 数据面
+        int   (*send_packet)(void *data, int len, uint32_t target_id);
+        void  (*handle_page_fault)(uint64_t gpa);      // 缺页回调
     
-    // 工具
-    void  (*log)(const char *fmt, ...);
-    int   (*is_atomic_context)(void);
-    void  (*touch_watchdog)(void);
+        // 工具
+        void  (*log)(const char *fmt, ...);
+        int   (*is_atomic_context)(void);
+        void  (*touch_watchdog)(void);
     
-    // [RUDP Support] 原子操作与时序控制
-    uint64_t (*atomic_inc_id)(void);           // 原子递增获取唯一 ReqID
-    uint64_t (*get_time_us)(void);             // 获取高精度时间 (微秒)
-    uint64_t (*time_diff_us)(uint64_t start);  // 计算时间差 (处理溢出)
-    int      (*check_req_status)(uint64_t id); // 检查请求位 (需包含读屏障 smp_rmb)
-    void     (*cpu_relax)(void);               // CPU 节能/让步指令
-};
-```
+        // [RUDP Support] 原子操作与时序控制
+        uint64_t (*atomic_inc_id)(void);           // 原子递增获取唯一 ReqID
+        uint64_t (*get_time_us)(void);             // 获取高精度时间 (微秒)
+        uint64_t (*time_diff_us)(uint64_t start);  // 计算时间差 (处理溢出)
+        int      (*check_req_status)(uint64_t id); // 检查请求位 (需包含读屏障 smp_rmb)
+        void     (*cpu_relax)(void);               // CPU 节能/让步指令
+    };
+    ```
 
 ## Step 3: 纯逻辑核心 (Logic Core)
 **文件**: `master_core/logic_core.c`
@@ -441,7 +441,7 @@ struct dsm_driver_ops {
 
 请先忽略所有的解释性文本，**直接开始生成** Step 0 到 Step 4 的代码。
 **重点验证**：`kernel_backend.c` 中必须显式定义 `gvm_vm_ops` 结构体，且 `ctl_tool` 不依赖 JSON 库。
-`` `
+```
 
 @@@@@
 
