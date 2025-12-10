@@ -211,192 +211,238 @@
 **使用说明**：
 这是你重启对话的“核按钮”。它包含了从配置宏到内核防护的所有细节。请直接复制以下所有内容。
 
-```markdown
+`` `markdown
 # 角色定义 (Role Definition)
-你是一名精通 Linux 内核架构 (Kernel 5.15)、QEMU 源码 (v5.2.0)、DPDK 网络编程及超大规模分布式系统设计的资深全栈架构师。
-我们正在开发 **GiantVM "Frontier-X" V15.5 (Oceanic Stack)**。
+你是一名精通 Linux Kernel (5.15), QEMU (5.2.0), DPDK 及超大规模分布式系统设计的首席架构师。
+我们的目标是构建 **GiantVM "Frontier-X" V15.5 (Full Stack Oceanic)**。
 
-**项目目标**：
-构建一个**支持 100,000+ 节点**的弹性双模分布式虚拟机系统。
-该系统必须具备工业级的鲁棒性，能够处理内存分配失败、网络拥塞及内核原子上下文死锁问题。
+**核心任务**：构建一个支持 100,000+ 节点的弹性双模分布式虚拟机，集成防内核栈溢出与防死锁机制，并包含完整的 QEMU 适配。
 
-**【环境版本锁定】(VERSION LOCK)**：
-1.  **Linux Kernel**: **5.15 LTS** (依赖其 io_uring 特性及稳定的 KVM API)。
-2.  **QEMU**: **5.2.0** (依赖其 AccelClass 架构)。
-3.  **Compiler**: GCC 9.4+ (C11 标准)。
-
-**核心架构 (Architecture)**：
-1.  **无限扩展 (Dynamic Scale)**：
-    *   **配置化**：所有规模参数由 `giantvm_config.h` 宏控制。
-    *   **动态大表**：Master 启动时使用 `vzalloc` (Kernel) 或 `calloc` (User) 申请元数据表。
-    *   **位运算路由**：使用 `Slave_ID >> SHIFT` 实现 O(1) 网关查找。
-2.  **弹性双模 (Elastic Hybrid)**：
-    *   **Logic/Backend 分离**：核心逻辑不依赖系统头文件，通过 Ops 接口调用后端。
-    *   **Tiered Scheduling**：vCPU 0-3 本地执行 (Tier 1)，vCPU 4-N 云端执行 (Tier 2)。
-3.  **内核生存法则 (Legacy Safety)**：
-    *   **继承自微改造方案**：必须强制集成原子上下文检查、NMI 看门狗喂狗、Slab 缓存分配。
-
-**核心约束 (CRITICAL RULES)**：
-1.  **接口一致性**：严格遵守 `dsm_driver_ops` 定义，必须包含 `free_packet`。
-2.  **内存安全**：
-    *   大表分配必须判空并打印 **FATAL** 日志。
-    *   模块退出必须释放资源。
-    *   数组访问必须查边界。
-3.  **网关策略**：Gateway 必须采用 **“全量指针数组 + 按需 Buffer 分配”** 策略，防止空闲内存浪费。
-4.  **工程规范**：所有头文件必须添加 `#ifndef` Include Guards；内核模块必须声明 `MODULE_LICENSE("GPL")`。
+**【环境版本锁定】**：
+1.  **Linux Kernel**: **5.15 LTS** (io_uring, KVM API, Vzalloc).
+2.  **QEMU**: **5.2.0** (AccelClass 架构).
 
 ---
 
-# 1. 强制目录结构 (Full Directory Structure)
-(必须严格遵守，不得修改文件名)
+# 1. 核心技术约束 (CRITICAL CONSTRAINTS)
+**违反以下规则视为代码不可用：**
 
+1.  **内存安全 (Memory Safety)**:
+    *   **栈安全**：由于 `copyset_t` 超过 12KB，**严禁在内核函数栈中定义 `copyset_t` 局部变量**。必须使用 `ops->alloc_packet` 在堆上分配。
+    *   **动态分配**：**严禁**使用静态数组。Master 启动时必须使用 `vzalloc` (Kernel) 或 `calloc` (User) 申请元数据表，并**立即检查 NULL**。
+    *   **网关优化**：Gateway 必须使用 **“二级指针数组”** (`struct buffer **buffers`) 管理内存，实现按需分配。
+
+2.  **生存法则 (Survival Rules)**:
+    *   **死锁防护**：在 `kernel_backend.c` 发送逻辑中，**必须**检查 `in_atomic() || irqs_disabled()`。若真，则进入轮询模式并调用 `touch_nmi_watchdog()`。
+    *   **API 隔离**：`logic_core.c` **严禁**包含 `<linux/*>` 或 `<stdio.h>`，只能包含 `platform_defs.h`。
+    *   **网络分片**：由于 `copyset_t` 可能大于 MTU (1500字节)，`send_packet` **必须**在内核底层实现自动分片 (Fragmentation)，严禁直接发送超大包导致丢包。
+    *   **物理映射**：Backend 必须维护 **Gateway ID -> IP Address** 的映射表，并提供接口供 Master 启动时动态配置。
+
+---
+
+# 2. 强制目录结构 (Directory Structure)
+*(必须严格遵守)*
+
+```text
 GiantVM-Frontier-V15.5/
-├── common_include/                 # [公共头文件]
-│   ├── giantvm_config.h            # [关键] 规模配置宏 (128k Nodes)
-│   ├── giantvm_protocol.h          # 协议定义 (Header + VCPU Context)
-│   └── platform_defs.h             # 环境垫片 (Kernel/User 隔离)
-│
-├── master_core/                    # [Master 核心]
-│   ├── Kbuild                      # Kernel 构建脚本
-│   ├── Makefile_User               # User 构建脚本
-│   ├── unified_driver.h            # Ops 接口 (已补全 free_packet)
-│   ├── logic_core.c                # [核心] 动态管理/路由/调度 (含详细 Log)
-│   ├── kernel_backend.c            # [Backend A] vzalloc/atomic/watchdog
-│   ├── user_backend.c              # [Backend B] calloc/UFFD
-│   └── main_wrapper.c              # User main()
-│
-├── qemu_patch/                     # [QEMU 5.2.0 Patch]
-│   ├── accel/giantvm/              # 定义加速器
-│   │   ├── giantvm-all.c           # init_machine, 注册 AccelClass
-│   │   └── giantvm-cpu.c           # 拦截 cpu_exec
-│   └── hw/giantvm/
-│       └── giantvm_mem.c           # MemoryRegionOps
-│
-├── gateway_service/                # [Gateway]
-│   ├── main.c
-│   └── aggregator.c                # 指针数组盲聚合
-│
-├── slave_daemon/                   # [Slave]
-│   ├── main.c
-│   ├── net_uring.c                 # io_uring 源端分片
+├── common_include/
+│   ├── giantvm_config.h            # 规模配置
+│   ├── giantvm_protocol.h          # 协议定义
+│   └── platform_defs.h             # 类型垫片
+├── master_core/
+│   ├── unified_driver.h            # 驱动接口
+│   ├── logic_core.c                # 纯逻辑核心
+│   ├── kernel_backend.c            # 内核后端
+│   ├── user_backend.c              # 用户后端
+│   └── main_wrapper.c              # 用户入口
+├── qemu_patch/
+│   ├── accel/giantvm/giantvm-all.c # 加速器注册
+│   ├── accel/giantvm/giantvm-cpu.c # CPU 拦截
+│   └── hw/giantvm/giantvm_mem.c    # 内存拦截
+├── gateway_service/
+│   └── aggregator.c                # 盲聚合
+├── slave_daemon/
+│   ├── net_uring.c                 # io_uring
 │   └── cpu_executor.c              # KVM Loop
-│
-├── guest_tools/                    # [Guest Utils]
-│   └── win_memory_hint.cpp         # VirtualAllocExNuma 占位工具
-│
-└── deploy/                         # [Deployment]
-    ├── master/setup_host.sh        # HugePages 配置
-    └── docker/Dockerfile           # Slave 容器
+├── guest_tools/
+│   └── win_memory_hint.cpp         # Guest 占位
+└── deploy/
+    └── sysctl_check.sh             # OS 参数检查
+```
 
 ---
 
-# 2. 详细全量开发指令 (Full Roadmap)
+# 3. 详细代码生成指令 (Detailed Roadmap)
 
-请按以下步骤生成代码。**请直接使用下文中给出的结构体定义。**
+请按以下顺序生成代码，严格执行每个 Step 的具体要求。
 
-## Step 1: 基础设施 (Infrastructure)
-**目标**：配置宏、协议与垫片。
+## Step 0: OS 环境预检 (sysctl_check.sh)
+**文件**: `deploy/sysctl_check.sh`
+编写 Bash 脚本，强制检查并设置：
+*   `fs.file-max` >= 2097152
+*   `net.core.somaxconn` >= 65535
+*   `vm.max_map_count` >= 262144
+*   `vm.nr_hugepages` >= 10240
+*   `net.ipv4.tcp_mem` (增大到 8GB 限制)
 
-*   **`common_include/giantvm_config.h`**:
-    *   添加 `#ifndef GIANTVM_CONFIG_H`。
+## Step 1: 基础设施定义 (Infrastructure)
+**文件**: `common_include/*`
+
+1.  **`giantvm_config.h`**:
+    *   使用 `#ifndef` 保护宏。
     *   `#define GVM_SLAVE_BITS 17` (131072 Nodes).
     *   `#define GVM_GW_BITS 13` (8192 Nodes/GW).
     *   `#define GVM_MAX_SLAVES (1UL << GVM_SLAVE_BITS)`.
     *   `#define GVM_MAX_GATEWAYS (GVM_MAX_SLAVES >> GVM_GW_BITS)`.
-*   **`common_include/giantvm_protocol.h`**:
-    *   `struct gvm_header` (packed):
-        *   `uint32_t magic;`
-        *   `uint16_t msg_type;`
-        *   `uint32_t slave_id;` (32-bit ID)
-        *   `uint64_t req_id;`
-        *   `uint32_t payload_len;`
-        *   `uint8_t  is_frag;`
-*   **`common_include/platform_defs.h`**:
-    *   `#ifdef __KERNEL__`: include `<linux/vmalloc.h>`, `<linux/slab.h>`, `<linux/types.h>`.
-    *   `#else`: include `<stdlib.h>`, `<stdint.h>`, `<string.h>`, `<stdio.h>`.
 
-## Step 2: 驱动接口与 Master 核心 (Driver & Core)
-**目标**：实现安全的内存管理与健壮的内核后端。
+2.  **`giantvm_protocol.h`**:
+    *   定义 `copyset_t`：`typedef struct { unsigned long bits[(GVM_MAX_SLAVES + 63) / 64]; } copyset_t;`
+    *   **CRITICAL**: 添加注释 `// WARNING: >16KB struct. DO NOT ALLOCATE ON STACK.`
+    *   定义 `struct gvm_header` (packed): 包含 `magic`, `type`, `slave_id` (uint32_t), `req_id`.
+    *   定义 `struct gvm_vcpu_context` (packed): 包含 `rax`...`r15`, `rip`, `rflags`, `cr0`...`cr4`.
+    *   定义 `uint16_t frag_seq;` // 分片序列号，用于重组
+    *   定义以下内容
+        ```
+        #define GVM_MSG_FLAG_REQUEST    (1 << 0) // 这是一个请求
+        #define GVM_MSG_FLAG_RESPONSE   (1 << 1) // 这是一个响应 (ACK)
+    
+        /* 
+         * [CRITICAL] 协议头必须包含可靠通信字段 
+         */
+        struct gvm_header {
+            uint32_t magic;
+            uint16_t type;           // 消息主类型 (e.g., INVALIDATE, VCPU_RUN)
+        
+            // --- 可靠通信字段 ---
+            uint64_t req_id;         // 全局唯一的请求ID，用于匹配请求和响应
+            uint8_t  flags;          // 标志位 (REQUEST / RESPONSE)
+            uint8_t  retry_count;    // 当前重传次数
+    
+            uint32_t target_id;      // 目标节点ID
+            uint32_t source_id;      // 源节点ID (Master是0)
+        
+            // ... 其他字段 ...
+        } __attribute__((packed));
+        ```
 
-*   **`master_core/unified_driver.h`**:
-    *   **必须按此定义**：
+3.  **`platform_defs.h`**:
+    *   `#ifdef __KERNEL__`: include `<linux/types.h>`, `<linux/vmalloc.h>`, `<linux/slab.h>`.
+    *   `#else`: include `<stdint.h>`, `<stdlib.h>`, `<string.h>`, `<stdio.h>`.
+
+## Step 2: 统一驱动接口 (Unified Driver)
+**文件**: `master_core/unified_driver.h`
+定义 `struct dsm_driver_ops`，必须准确包含以下字段：
+```c
+struct dsm_driver_ops {
+    void* (*alloc_large_table)(size_t size);       // 用于节点状态表 (vzalloc/calloc)
+    void  (*free_large_table)(void *ptr);
+    void (*set_gateway_ip)(uint32_t gw_id, uint32_t ip, uint16_t port); // 配置网关物理地址
+    void* (*alloc_packet)(size_t size, int atomic);// 用于 copyset/packet (Slab/Pool)
+    void  (*free_packet)(void *ptr);
+    int   (*send_packet)(void *data, int len, uint32_t target_id);
+    void  (*log)(const char *fmt, ...);
+    int   (*is_atomic_context)(void);              // 检查是否在原子上下文
+    void  (*touch_watchdog)(void);                 // 喂狗
+    //时间与定时器接口
+    uint64_t (*get_monotonic_ns)(void); // 获取单调递增的纳秒时间戳
+    void*    (*create_timer)(uint64_t interval_ms, void (*callback)(void *), void *ctx);
+    void     (*destroy_timer)(void *timer_handle);
+};
+```
+
+## Step 3: 纯逻辑核心 (Logic Core)
+**文件**: `master_core/logic_core.c`
+
+1.  **Global**: `static struct node_status *global_node_table = NULL;`
+2.  **Init**:
+    *   `size_t size = sizeof(struct node_status) * GVM_MAX_SLAVES;`
+    *   `global_node_table = ops->alloc_large_table(size);`
+    *   **CHECK**: `if (!global_node_table) { ops->log("FATAL: OOM"); return -1; }`
+    *   Log success message.
+3.  **Routing**: 实现 `get_gateway_id`: `return slave_id >> GVM_GW_BITS;`
+4.  **Stack Safety (Critical)**:
+    *   在处理 Multicast/Invalidate 逻辑时，**演示如何分配 Copyset**：
+    *   `copyset_t *cp = ops->alloc_packet(sizeof(copyset_t), 0);`
+    *   `if (!cp) return;`
+    *   `// use cp...`
+    *   `ops->free_packet(cp);`
+
+## Step 4: 内核后端实现 (Kernel Backend)
+**文件**: `master_core/kernel_backend.c`
+
+1.  **Headers**: include `<linux/module.h>`, `<linux/net.h>`, `platform_defs.h`.
+2.  **License**: `MODULE_LICENSE("GPL");`
+3.  **Impl `alloc_large_table`**: `return vzalloc(size);`
+4.  **Impl `alloc_packet`**: 使用 `kmem_cache_alloc` (需要先在 module_init 创建 cache).
+5.  **Impl `send_packet` (Deadlock Protection)**:
     ```c
-    struct dsm_driver_ops {
-        // 大内存管理
-        void* (*alloc_large_table)(size_t size);
-        void  (*free_large_table)(void *ptr);
-        // 网络包管理 (Slab)
-        void* (*alloc_packet)(size_t size, int atomic);
-        void  (*free_packet)(void *ptr);  // [已补全]
-        // 网络 I/O
-        int   (*send_packet)(void *data, int len, uint32_t target_id);
-        // 调试与状态
-        void  (*log)(const char *fmt, ...);
-        int   (*is_atomic_context)(void);
-        void  (*touch_watchdog)(void);
-    };
+    if (in_atomic() || irqs_disabled()) {
+        // Atomic Path
+        while (!try_send_poll(skb)) {
+            udelay(10);
+            touch_nmi_watchdog();
+            touch_softlockup_watchdog();
+        }
+    } else {
+        // Standard Path
+        sock_sendmsg(sock, msg);
+    }
     ```
-*   **`master_core/kernel_backend.c`**:
-    *   `MODULE_LICENSE("GPL");`
-    *   **Impl `alloc_large_table`**: `return vzalloc(size);` (Warning: Check process context).
-    *   **Impl `alloc_packet`**: `kmem_cache_alloc`.
-    *   **Impl `send_packet`**:
-        *   `if (in_atomic() || irqs_disabled())`:
-            *   Loop: `udp_poll_send` + `udelay(10)` + `touch_nmi_watchdog()`.
-        *   `else`: `kernel_sendmsg`.
-*   **`master_core/logic_core.c`**:
-    *   **Global**: `static struct node_status *node_table = NULL;`
-    *   **Init**:
-        *   `node_table = ops->alloc_large_table(...)`.
-        *   **CRITICAL**: `if (!node_table) { ops->log("FATAL: OOM in logic_init"); return -1; }`
-        *   `ops->log("Logic Init: Allocated table for %u nodes", GVM_MAX_SLAVES);`
-    *   **Sched**: `(vcpu < 4) ? LOCAL : REMOTE`.
+6.  **Impl `get_monotonic_ns`**: `return ktime_get_ns();`
+7.  **Impl `create_timer`**:
+    *   使用 `hrtimer_init` 初始化一个高精度定时器。
+    *   设置回调函数。
+    *   使用 `hrtimer_start` 启动它，模式为 `HRTIMER_MODE_REL`。
+    *   返回定时器的句柄。
+8.  **Gateway Map**: 定义 `static struct sockaddr_in gateway_table[GVM_MAX_GATEWAYS];` 并实现 `set_gateway_ip` 用于填充此表。
+9.  **Fragmentation**: 在 `send_packet` 中，判断 `if (len > MTU)`，若为真则进行循环切片发送，并设置 Header 中的 `is_frag=1`。
 
-## Step 3: QEMU 适配层 (QEMU 5.2.0 Frontend)
-**目标**：适配 QEMU 5.2.0 加速器架构。
+## Step 5: 用户态后端 (User Backend)
+**文件**: `master_core/user_backend.c`
+1.  **Impl `alloc_large_table`**: `return calloc(1, size);`
+2.  **Impl `send_packet`**: `sendto(sockfd, ...)`
+3.  **Impl `log`**: `vprintf` to stdout.
+4.  **Impl `get_monotonic_ns`**: `struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e9 + ts.tv_nsec;`
+5.  **Impl `create_timer`**:
+    *   创建一个新线程作为定时器线程。
+    *   在该线程的循环中，使用 `timerfd_create` 和 `timerfd_settime` 创建一个周期性触发的定时器。
+    *   使用 `read()` 等待 `timerfd` 到期。
+    *   到期后，调用传入的 `callback` 函数。
 
-*   **`qemu_patch/accel/giantvm/giantvm-all.c`**:
-    *   使用 `type_init` 宏注册 `TYPE_GIANTVM_ACCEL`。
-    *   实现 `init_machine`: 打开 Master 设备文件 (`/dev/giantvm`)。
-*   **`qemu_patch/accel/giantvm/giantvm-cpu.c`**:
-    *   拦截 `cpu_exec`。
-    *   构造 `gvm_vcpu_context`，调用 Master Core。
-*   **`qemu_patch/hw/giantvm/giantvm_mem.c`**:
-    *   定义 `MemoryRegionOps`，将读写重定向到 GiantVM Backend。
+## Step 6: 优化的网关聚合 (Gateway)
+**文件**: `gateway_service/aggregator.c`
 
-## Step 4: 优化的网关服务 (Gateway Optimized)
-**目标**：实现低内存占用的盲聚合。
+1.  **Structure**: 定义 `struct slave_buffer **buffers;` (二级指针)。
+2.  **Init**: `buffers = calloc(GVM_MAX_SLAVES, sizeof(void*));` (只分配指针数组，约 800KB).
+3.  **Process**:
+    *   `if (buffers[target_id] == NULL) buffers[target_id] = malloc(MTU);`
+    *   执行 memcpy。
+    *   检查 `len > 1200` 或 `timer_expired` -> 发送并重置 len。
 
-*   **`gateway_service/aggregator.c`**:
-    *   Include `giantvm_config.h`.
-    *   **Data Structure**: `struct slave_buffer **buffers;` (Pointer Array).
-    *   **Init**:
-        *   `buffers = calloc(GVM_MAX_SLAVES, sizeof(void*));`
-        *   Check NULL.
-    *   **Process Packet**:
-        *   `if (buffers[target_id] == NULL)`: `buffers[target_id] = malloc(MTU);`
-        *   执行 `memcpy` 聚合逻辑。
-        *   检查是否满包或超时，若是则发送。
+## Step 7: QEMU 5.2.0 适配 (Frontend)
+**文件**: `qemu_patch/accel/giantvm/giantvm-all.c`, `giantvm-cpu.c`
 
-## Step 5: 从节点与部署 (Slave & Deploy)
-**目标**：实现计算执行与自动化部署。
+1.  **Type Init**: 使用 `type_init(giantvm_accel_register_types)` 注册 `TYPE_GIANTVM_ACCEL`。
+2.  **Init Machine**: 在 `init_machine` 钩子中打开 Master Core 设备文件 (`/dev/giantvm`).
+3.  **CPU Exec**:
+    *   在 `giantvm-cpu.c` 中实现 `giantvm_cpu_exec(CPUState *cpu)`.
+    *   Loop: `ops.vcpu_run(cpu->cpu_index, &regs)`.
+    *   Handle Exits: IO/MMIO/Shutdown.
 
-*   **`slave_daemon/net_uring.c`**:
-    *   实现源端分片 (Source Fragmentation)，适配 MTU 1280。
-*   **`deploy/master/setup_host.sh`**:
-    *   `sysctl -w vm.nr_hugepages=10240` (开启大页，降低页表开销).
-*   **`guest_tools/win_memory_hint.cpp`**:
-    *   使用 `VirtualAllocExNuma` 申请内存，伪造 NUMA 拓扑。
+## Step 8: 部署与从节点 (Slave & Deploy)
+**文件**: `slave_daemon/net_uring.c`, `guest_tools/win_memory_hint.cpp`
+
+1.  **Slave**: 实现 `io_uring` 的 `IORING_OP_SENDMSG`，包含源端分片逻辑。
+2.  **Guest Tool**: 调用 `VirtualAllocExNuma(..., NUMA_NO_LOCAL_NODE)` 申请内存，防止 Windows 将远程 RAM 视为本地 RAM 而导致超时。
 
 ---
 
-**执行指令 (Command)**:
+**执行指令 (Action)**:
 
-**请先执行 Step 1 (基础设施) 和 Step 2 (核心与接口) 的代码生成。**
-**特别注意**：
-1.  确保 `kernel_backend.c` 中包含了完整的死锁防护逻辑（原子检查 + 看门狗）。
-2.  确保 `dsm_driver_ops` 定义中包含了 `free_packet`，且在逻辑层正确调用。
-```
+**任务 1**: 请先生成 **Step 0, Step 1, Step 2, Step 3** 的代码。
+**任务 2**: 确保 Step 3 中的 `copyset_t` 分配严格遵循堆分配原则。
+**任务 3**: 确保 Step 1 中的 `GVM_SLAVE_BITS` 是受 `#ifndef` 保护的。
+`` `
 
 @@@@@
 
