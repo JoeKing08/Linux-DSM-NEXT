@@ -17,7 +17,7 @@
 | **内存容量** | 受限于单机物理 RAM | **PB 级统一寻址** | **MESI 协议**：将十万个节点的 RAM 聚合为 Master 的一段连续物理地址空间。 |
 | **系统稳定性** | 极易死机 (原子上下文死锁) | **工业级鲁棒 (Industrial Robust)** | **内核生存法则**：强制集成原子上下文检查 (`in_atomic`)、NMI 看门狗喂狗、Slab 缓存防栈溢出。 |
 | **部署形态** | 仅依赖 QEMU | **双模 (Kernel/User)** | **Logic/Backend 分离**：一套核心代码，既是高性能内核模块 (Mode A)，又是兼容性好的用户态程序 (Mode B)。 |
-| **网络性能** | E5 CPU 中断风暴 | **PPS 降低 80%** | **Gateway 盲聚合**：动态分配聚合缓冲，将小包合并，拯救头节点 CPU。 |
+| **网络性能** | E5 CPU 中断风暴 | **多核均衡 & 批处理** | **SO_REUSEPORT + recvmmsg**：多线程绑定物理核，利用内核级负载均衡和系统调用批处理，消除单线程瓶颈。 |
 | **控制完整性**| 无（硬编码 IP） | **全栈闭环 (Control Plane)** | **ioctl + mmap**：用户态工具注入网关拓扑，QEMU 通过 mmap 映射虚拟内存。 |
 
 ---
@@ -51,12 +51,12 @@
                                      | (UDP / 100Gbps)
                                      v
                        [ Gateway Cluster (1...N) ]
-                       - 指针数组 (Pointer Array) 管理内存
-                       - 盲聚合 (Blind Aggregation)
+                       - 懒加载聚合 (Lazy Aggregation)
+                       - 细粒度锁 (Per-Slave Mutex)
                                      |
                                      v
                         [ Slave Cluster (1...100,000) ]
-                        - net_uring (源端分片)
+                        - net_uring (recvmmsg + 线程亲和性)
                         - cpu_executor (KVM Loop)
 ```
 
@@ -66,35 +66,41 @@
 
 1.  **`common_include/` (真理之源)**
     *   **`giantvm_config.h`**: 定义 `GVM_SLAVE_BITS` (17->128k节点)。所有组件引用此文件，严禁硬编码。
-    *   **`giantvm_protocol.h`**: 定义 `gvm_header` (packed, `uint32_t slave_id`), `copyset_t` (并注明严禁栈分配)。
+    *   **`giantvm_protocol.h`**: 定义 `gvm_header` (packed), `copyset_t` (并注明严禁栈分配)。新增 Mode B 的 IPC 协议定义。
     *   **`giantvm_ioctl.h`**: 定义 `IOCTL_SET_GATEWAY`，用于控制面注入 IP。
     *   **`platform_defs.h`**: 环境垫片，隔离 `<linux/vmalloc.h>` 和 `<stdlib.h>`。
 
 2.  **`master_core/` (大脑)**
-    *   **`unified_driver.h`**: 定义 `dsm_driver_ops`，包含 `alloc_large_table`, `set_gateway_ip`, `send_packet` 等接口。
+    *   **`unified_driver.h`**: 定义 `dsm_driver_ops`，包含 `alloc_large_table`, `set_gateway_ip`，以及新增的 O(1) ID 分配器接口。
     *   **`logic_core.c`**: **纯逻辑**。
         *   **Init**: 调用 `alloc_large_table` 并**检查 NULL**。
-        *   **Stack Safety**: 使用 `alloc_packet` 分配 `copyset_t`，防止内核栈溢出。
+        *   **Reliability**: 实现 `gvm_rpc_call`，包含超时重传和喂狗逻辑。
         *   **Routing**: 位运算路由。
     *   **`kernel_backend.c`**: **全功能引擎**。
-        *   **File Ops**: 实现 `unlocked_ioctl` (注入 IP) 和 `mmap` (QEMU 内存映射)。
-        *   **Memory**: 使用 `vzalloc` (大表) 和 `kmem_cache` (小包)。
-        *   **Safety**: 发包前检查 `in_atomic()`，若真则 Poll + Watchdog。
-    *   **`user_backend.c`**: 使用 `calloc` / `free` 实现对应接口，适配 Mode B。
+        *   **Network**: `kernel_sendmsg` 配合 `MSG_DONTWAIT` 和 `udelay` 防止死锁。
+        *   **Memory**: 使用 `vzalloc` (大表) 和 `kmem_cache` (小包，防止内存碎片)。
+        *   **Concurrency**: 使用自旋锁 (`spinlock`) 保护 ID 环形缓冲区。
+    *   **`user_backend.c`**: 使用 `pthread` 互斥锁保护请求上下文，使用非阻塞 Socket 和 `epoll/recvfrom` 线程处理数据。
 
 3.  **`ctl_tool/` (控制面工具 - 新增)**
-    *   **`main.c`**: 解析 JSON 配置文件，通过 `ioctl` 将网关 IP 表注入内核。
+    *   **`main.c`**: 解析文本配置文件，通过 `ioctl` 将网关 IP 表注入内核。
 
 4.  **`qemu_patch/` (前端适配)**
     *   **`accel/giantvm/`**: 实现 `AccelClass`。
-        *   `init_machine`: 打开 `/dev/giantvm` 并 `mmap`。
+        *   `init_machine`: 根据 Mode A/B 选择打开 `/dev/giantvm` 或连接 Unix Socket。
         *   `cpu_exec`: 拦截 CPU 循环，调用 Master Core 进行 Tiered Scheduling。
+        *   `giantvm-uffd.c`: 多线程 UFFD 处理，配合 Mode B 实现用户态缺页。
 
 5.  **`gateway_service/` (分片网关)**
-    *   **`aggregator.c`**: 采用“二级指针数组 + 按需分配”策略，避免 10 万节点占用过多空闲内存。
+    *   **`aggregator.c`**: 采用“按需分配 (Lazy Allocation) + 细粒度锁”策略。
+        *   **Push**: 当数据到达时才分配缓冲区，避免空闲节点占用内存。
+        *   **Safety**: 每个 Slave ID 拥有独立的互斥锁，支持高并发推送。
 
 6.  **`slave_daemon/` (肌肉)**
-    *   **`net_uring.c`**: 基于 `io_uring` 的高性能网络层，支持源端分片。
+    *   **`net_uring.c`**: **高性能批处理网络层**。
+        *   **SO_REUSEPORT**: 允许多个线程绑定同一端口，内核自动负载均衡。
+        *   **recvmmsg**: 单次系统调用接收多个数据包，大幅降低 Syscall 开销（比 io_uring 更成熟稳定）。
+        *   **Affinity**: 线程绑定 CPU 物理核，减少上下文切换。
     *   **`cpu_executor.c`**: 简单的 KVM 执行循环。
 
 7.  **`deploy/` (部署)**
@@ -115,34 +121,21 @@
 **核心优势**：零拷贝、零上下文切换、显卡直通、抗死锁。
 
 #### 1. 启动阶段 (Bootstrapping)
-1.  **加载模块**：管理员执行 `insmod giantvm.ko`。
-    *   **后端动作**：`kernel_backend.c` 的 `module_init` 被调用。它使用 `vzalloc` 向内核申请一块巨大的连续虚拟内存（比如 200MB）用来存放 10 万个节点的状态表。同时创建 `kmem_cache` 用于网络包的高效分配。
-    *   **设备注册**：注册字符设备 `/dev/giantvm`。
-2.  **注入拓扑**：管理员运行 `./gvm_ctl gateway_list.txt`。
-    *   **流程**：工具解析文本 -> 调用 `ioctl(fd, IOCTL_SET_GATEWAY)` -> 内核后端将网关 IP 填入 `gateway_table` 数组。
-3.  **启动 QEMU**：
-    *   命令：`qemu-system-x86_64 -accel giantvm -m 1TB ...`
-    *   **内存映射**：QEMU 打开 `/dev/giantvm` 并执行 `mmap`。内核后端调用 `gvm_mmap`，将这 1TB 的虚拟地址空间的操作权（`vm_ops`）接管过来。
+1.  **加载模块**：`kernel_backend.c` 的 `module_init` 被调用。它使用 `vzalloc` 申请大表，创建专用 Slab 缓存 `gvm_pkt_v16`。
+2.  **注入拓扑**：管理员运行 `gvm_ctl`，通过 `ioctl` 将网关 IP 填入内核数组。
+3.  **启动 QEMU**：QEMU `mmap` `/dev/giantvm`，内核后端接管 `vm_ops`。
 
 #### 2. 运行阶段：玩《赛博朋克 2077》
 假设此时 vCPU 0 (本地) 正在渲染画面，vCPU 4 (远程) 正在计算物理碰撞。
 
 *   **Step A: 内存读取 (缺页中断)**
-    1.  **触发**：vCPU 4 试图读取地址 `0xA000`（地图数据）。该页不在本地物理 RAM 中。
-    2.  **拦截**：CPU 触发 Page Fault (#PF)。Linux 内核发现该 VMA 归 GiantVM 管，调用 `gvm_vm_ops->fault`。
-    3.  **逻辑**：控制权转给 `logic_core.c`。它计算 `Target_Slave = 0xA000 >> 12`，决定需要向 Slave #5 请求数据。
-    4.  **发包 (RUDP)**：
-        *   调用 `ops->alloc_packet` 从 Slab 缓存拿一个包。
-        *   调用 `ops->send_packet`。
-        *   **死锁防护**：后端检查 `in_atomic()`。发现当前处于缺页中断（原子上下文），于是**不睡眠**，而是进入 `while` 循环，一边轮询网卡，一边喂狗 (`touch_nmi_watchdog`)，直到数据发出。
-    5.  **恢复**：收到数据后，内核直接将数据填入物理页，vCPU 继续运行。**全程无用户态切换，微秒级延迟。**
-
-*   **Step B: CPU 指令执行 (Tiered Scheduling)**
-    1.  **拦截**：QEMU 的 CPU 循环调用 `giantvm_cpu_exec`。
-    2.  **分流**：
-        *   **vCPU 0**：调度策略判断为 **Tier 1**。后端直接调用 `kvm_vcpu_ioctl(KVM_RUN)`。这就像普通虚拟机一样，直接跑在本地物理 CPU 上，**显卡驱动响应速度 = 物理机**。
-        *   **vCPU 4**：调度策略判断为 **Tier 2**。后端将寄存器（RAX, RIP...）序列化，封装成 UDP 包，通过网关发给 Slave。
-    3.  **远程执行**：Slave 收到包，恢复寄存器，跑一段代码，把结果发回来。Master 收到结果，更新 QEMU 状态。
+    1.  **触发**：vCPU 4 试图读取地址 `0xA000`。
+    2.  **拦截**：调用 `gvm_vm_ops->fault`，转入 `logic_core`。
+    3.  **发包 (RUDP)**：
+        *   `logic_core` 计算路由，请求 `alloc_req_id`（O(1) 环形缓冲区）。
+        *   调用 `k_send_packet`。
+        *   **死锁防护**：后端检测 `in_atomic()`。若真，则使用 `MSG_DONTWAIT` 非阻塞发送，并在循环中调用 `udelay(10)` 和 `touch_nmi_watchdog()`，确保网卡中断能被处理且系统不 Panic。
+    4.  **恢复**：收到数据后，`giantvm_udp_data_ready` 回调直接将数据 `memcpy` 到 `alloc_page` 申请的物理页，并插入页表。
 
 ---
 
@@ -151,29 +144,19 @@
 **核心优势**：无 Root 权限也能跑、部署简单、崩溃不蓝屏。
 
 #### 1. 启动阶段 (Bootstrapping)
-1.  **启动进程**：用户运行 `./giantvm_master`。
-    *   **后端动作**：`user_backend.c` 启动。它使用标准 `calloc` 分配内存表。它创建一个 UDP Socket 并绑定端口。
-    *   **UFFD 注册**：它申请一大块匿名内存（`malloc`），并使用 `ioctl(UFFDIO_REGISTER)` 告诉内核：“这块内存归我管，有人动它就通知我”。
-2.  **启动 QEMU**：
-    *   在 Mode B 下，QEMU 通常通过 Socket 或共享内存与 `giantvm_master` 进程通信（或者 `giantvm_master` 本身就是一个修改版的 QEMU）。
+1.  **启动进程**：`main_wrapper.c` 启动，初始化 `user_backend`，监听 Unix Socket。
+2.  **启动 QEMU**：QEMU 连接 Master 的 Unix Socket，并映射 `/dev/shm` 共享内存。启动多线程 UFFD 处理机制。
 
 #### 2. 运行阶段：跑大规模矩阵运算 (MPI)
 
 *   **Step A: 内存读取 (UserfaultFD)**
-    1.  **触发**：QEMU 线程读取地址 `0xB000`。
-    2.  **挂起**：内核发现该页被 UFFD 监控且未映射，于是**暂停 QEMU 线程**，并向 `giantvm_master` 发送一个事件。
-    3.  **处理**：`giantvm_master` 的 Epoll 循环收到事件。
+    1.  **触发**：QEMU 线程读取缺页内存。
+    2.  **挂起**：内核暂停 QEMU 线程。`giantvm-uffd` 的 Distributor 线程捕获事件，分发给 Worker 线程。
+    3.  **处理**：Worker 线程通过 Unix Socket 请求 Master 填充数据。
     4.  **发包**：
-        *   调用 `logic_core` 查找路由。
-        *   调用 `sendto()` 标准接口发送 UDP 包。
-    5.  **恢复**：收到 Slave 回复的数据后，`giantvm_master` 调用 `ioctl(UFFDIO_COPY)` 把数据拷贝进那块内存，并唤醒 QEMU 线程。
-    *   *区别*：相比 Mode A，这里多了一次“内核 -> 用户态 -> 内核”的上下文切换，但在 100Gbps 网络下，计算吞吐量依然能跑满。
-
-*   **Step B: CPU 指令执行**
-    1.  **拦截**：原理与 Mode A 类似，但底层实现不同。
-    2.  **分流**：
-        *   **Tier 1**：如果当前用户有访问 `/dev/kvm` 的权限（在 kvm 组），依然可以加速。如果没有（纯容器），则回退到 TCG 纯软件模拟（慢，但能跑）。
-        *   **Tier 2**：通过标准 Socket 发送任务给 Slave。这对算力吞吐没有影响，因为瓶颈在 Slave 的 CPU 而不是 Master 的调度。
+        *   Master 的 `logic_core` 计算路由。
+        *   调用 `u_send_packet`，使用 `pthread_mutex` 保护上下文，通过非阻塞 UDP Socket 发送。
+    5.  **恢复**：Slave 回复数据，Master 的 RX 线程接收并写入共享内存。Worker 线程收到 ACK 后，调用 `ioctl(UFFDIO_WAKE)` 唤醒 QEMU。
 
 ---
 
@@ -183,8 +166,8 @@
 
 | 场景 | V16 Kernel Mode (Mode A) | V16 User Mode (Mode B) | 普通物理 PC | 评价 |
 | :--- | :--- | :--- | :--- | :--- |
-| **3A 游戏 (延迟敏感)** | **99%** | 85% | 100% | Tier 1 本地化策略让显卡驱动和主线程在本地跑，消除了网络延迟。 |
-| **HPC/编译 (吞吐敏感)** | **100,000x** | 95,000x | 1x | 10 万个 Slave 并行计算，动态路由开销 O(1) 忽略不计。 |
+| **3A 游戏 (延迟敏感)** | **99%** | 85% | 100% | Kernel 模式下的看门狗机制和零拷贝路径极大降低了抖动。 |
+| **HPC/编译 (吞吐敏感)** | **100,000x** | 95,000x | 1x | 多线程 UFFD 和 Slave 端的 recvmmsg 批处理确保了高吞吐。 |
 | **系统启动内存** | **按需分配 (MB级)** | 按需分配 (MB级) | N/A | V16 移除了静态数组，小规模部署时不浪费内存。 |
 | **抗死机能力** | **极高** | 极高 | N/A | 集成看门狗与原子检查，网络拥堵时系统只会变慢，不会死锁。 |
 | **部署灵活性** | 需 Root | **无特权兼容** | N/A | Mode B 可在云主机运行，Mode A 可在物理机狂飙。 |
@@ -193,7 +176,7 @@
 
 ### 📝 第五部分：V16 终极执行提示词
 
-这是你需要发送给 AI 的**最终指令**。它包含了上述所有架构细节和代码约束。
+这是你需要发送给 AI 的**最终指令**。它包含了上述所有架构细节和代码约束，并修正了技术实现描述。
 
 ```markdown
 # 1. 角色与项目定义 (Role & Project)
@@ -207,7 +190,7 @@
 2.  **数据面无限**：通过 `vzalloc` 和位运算路由支持十万级规模。
 
 **【环境版本锁定】**：
-*   **Linux Kernel**: **5.15 LTS** (依赖 `io_uring`, `vm_ops->fault`).
+*   **Linux Kernel**: **5.15 LTS** (依赖 `vm_ops->fault`, `recvmmsg`).
 *   **QEMU**: **5.2.0** (依赖 `AccelClass`).
 
 ---
@@ -217,17 +200,16 @@
 
 1.  **无限扩展 (Infinite Scale)**:
     *   **严禁硬编码**：所有规模参数必须来自 `giantvm_config.h` 的宏。
-    *   **严禁静态大数组**：Master 的节点状态表必须使用 `vzalloc` (Kernel) 或 `calloc` (User) 动态申请。
+    *   **严禁静态大数组**：Master 的节点状态表必须使用 `vzalloc` (Kernel) 或 `calloc` (User) 动态申请。Gateway 的缓冲区必须使用 Lazy Allocation。
     *   **位运算路由**：必须使用 `Slave_ID >> SHIFT` 进行路由。
 
 2.  **生存法则 (Survival Rules)**:
-    *   **内核态死锁防护**：在 `kernel_backend.c` 的发包逻辑中，**必须**判断 `in_atomic() || irqs_disabled()`。若为真，**必须**切换到轮询模式，并在循环中调用 `touch_nmi_watchdog()` 和 `udelay(10)`。
-    *   **栈溢出防护**：`copyset_t` (>12KB) **严禁在内核栈上定义**。必须通过 `ops->alloc_packet` 在堆上分配。
+    *   **内核态死锁防护**：在 `kernel_backend.c` 的发包逻辑中，**必须**判断 `in_atomic() || irqs_disabled()`。若为真，**必须**使用 `MSG_DONTWAIT` 并在循环中调用 `touch_nmi_watchdog()` 和 `udelay(10)`。
+    *   **内存安全**：`alloc_page` 后必须正确处理引用计数（`put_page`）。`copyset_t` 严禁在内核栈上分配。
 
-3.  **控制面完整性 (Control Plane)**:
-    *   内核模块必须实现 `file_operations` 的 `unlocked_ioctl` 和 `mmap`。
-    *   `mmap` 必须注册 `vm_operations_struct` 并实现 `.fault` 处理缺页。
-    *   **无依赖解析**：`ctl_tool` 必须使用简单的字符串解析（strtok），严禁引入 cJSON 等第三方库。
+3.  **高性能 I/O (High Perf I/O)**:
+    *   **Slave 端**：严禁使用单线程阻塞 I/O。必须使用 **`SO_REUSEPORT` 多线程** + **`recvmmsg` 批处理** 的组合来实现高吞吐。
+    *   **Gateway 端**：必须使用细粒度锁（Per-Slave Mutex）和非阻塞 Socket。
 
 ---
 
@@ -237,18 +219,18 @@
 GiantVM-Frontier-V16/
 ├── common_include/
 │   ├── giantvm_config.h            # [宏] 规模配置
-│   ├── giantvm_protocol.h          # [结构] 协议头
+│   ├── giantvm_protocol.h          # [结构] 协议头 & IPC
 │   ├── giantvm_ioctl.h             # [结构] IOCTL 定义
 │   └── platform_defs.h             # [垫片] 类型隔离
 ├── master_core/
 │   ├── unified_driver.h            # [接口] Ops 定义
 │   ├── logic_core.h               # [接口] 用于链接
-│   ├── logic_core.c                # [逻辑] 核心算法
-│   ├── kernel_backend.c            # [后端A] mmap/ioctl/vzalloc
-│   ├── user_backend.c              # [后端B] calloc/socket
+│   ├── logic_core.c                # [逻辑] 核心算法 (RUDP)
+│   ├── kernel_backend.c            # [后端A] mmap/ioctl/vzalloc/atomic_send
+│   ├── user_backend.c              # [后端B] pthread/epoll
 │   ├── Kbuild                      # Kernel 构建脚本
 │   ├── Makefile_User               # User 构建脚本
-│   └── main_wrapper.c              # User 入口
+│   └── main_wrapper.c              # User 入口 (IPC)
 ├── ctl_tool/                       # [工具] 控制面注入器
 │   ├── Makefile                    # 构建脚本
 │   ├── main.c                      # 文本解析 -> IOCTL
@@ -256,13 +238,14 @@ GiantVM-Frontier-V16/
 ├── qemu_patch/                     # [QEMU 5.2.0]
 │   ├── accel/giantvm/giantvm-all.c # AccelClass 注册
 │   ├── accel/giantvm/giantvm-cpu.c # CPU 拦截
+│   ├── accel/giantvm/giantvm-uffd.c# [新增] 多线程 UFFD
 │   └── hw/giantvm/giantvm_mem.c    # 内存拦截
 ├── gateway_service/
-│   ├── aggregator.c                # 盲聚合
-│   └── main.c
+│   ├── aggregator.h                # 接口
+│   └── aggregator.c                # Lazy Alloc + Mutex
 ├── slave_daemon/
-│   ├── net_uring.c                 # 源端分片
-│   └── cpu_executor.c              # KVM Loop
+│   ├── net_uring.c                 # [核心] SO_REUSEPORT + recvmmsg
+│   ├── cpu_executor.c              # KVM Loop
 │   └── Makefile                   # 构建脚本
 ├── guest_tools/
 │   └── win_memory_hint.cpp         # vNUMA 欺骗
@@ -277,171 +260,46 @@ GiantVM-Frontier-V16/
 
 ## Step 0: 环境预检 (sysctl_check.sh)
 **文件**: `deploy/sysctl_check.sh`
-*   设置 `fs.file-max` > 2000000, `vm.max_map_count` > 260000, `vm.nr_hugepages` > 10240.
+*   设置 `fs.file-max`, `vm.max_map_count`, `vm.nr_hugepages`.
 
 ## Step 1: 基础设施定义 (Infrastructure)
 **文件**: `common_include/*`
-
-1.  **`giantvm_config.h`**:
-    *   `#ifndef GVM_SLAVE_BITS` (默认 17).
-    *   `#define GVM_MAX_SLAVES (1UL << GVM_SLAVE_BITS)`.
-2.  **`giantvm_protocol.h`**:
-    *   `struct gvm_header` (packed): `magic`, `msg_type`, `slave_id` (**uint32_t**), `req_id`, `frag_seq`, `is_frag`.
-    *   `copyset_t`: `unsigned long bits[(GVM_MAX_SLAVES + 63) / 64];`
-    *   **Comment**: `// WARNING: Struct > 16KB. Heap allocation ONLY.`
-3.  **`giantvm_ioctl.h`**:
-    *   `struct gvm_ioctl_gateway { uint32_t gw_id; uint32_t ip; uint16_t port; };`
-    *   `#define IOCTL_SET_GATEWAY _IOW('G', 1, struct gvm_ioctl_gateway)`
-4.  **`platform_defs.h`**:
-    *   `#ifdef __KERNEL__`: include `<linux/types.h>`, `<linux/vmalloc.h>`, `<linux/slab.h>`.
-    *   `#else`: include `<stdint.h>`, `<stdlib.h>`, `<stdio.h>`.
+*   `giantvm_config.h`: `GVM_SLAVE_BITS` = 17.
+*   `giantvm_protocol.h`: `copyset_t`, `gvm_ipc_fault_req` (User Mode IPC).
 
 ## Step 2: 统一驱动接口 (Unified Driver)
 **文件**: `master_core/unified_driver.h`
-定义 `struct dsm_driver_ops`，必须包含：
-    ```c
-    struct dsm_driver_ops {
-        void* (*alloc_large_table)(size_t size);       // 大表 (vzalloc)
-        void  (*free_large_table)(void *ptr);
-        void* (*alloc_packet)(size_t size, int atomic);// 小包 (Slab)
-        void  (*free_packet)(void *ptr);
-    
-        // 控制面
-        void  (*set_gateway_ip)(uint32_t gw_id, uint32_t ip, uint16_t port);
-    
-        // 数据面
-        int   (*send_packet)(void *data, int len, uint32_t target_id);
-        void  (*handle_page_fault)(uint64_t gpa);      // 缺页回调
-    
-        // 工具
-        void  (*log)(const char *fmt, ...);
-        int   (*is_atomic_context)(void);
-        void  (*touch_watchdog)(void);
-    
-        // [RUDP Support] 原子操作与时序控制
-        uint64_t (*atomic_inc_id)(void);           // 原子递增获取唯一 ReqID
-        uint64_t (*get_time_us)(void);             // 获取高精度时间 (微秒)
-        uint64_t (*time_diff_us)(uint64_t start);  // 计算时间差 (处理溢出)
-        int      (*check_req_status)(uint64_t id); // 检查请求位 (需包含读屏障 smp_rmb)
-        void     (*cpu_relax)(void);               // CPU 节能/让步指令
-    };
-    ```
+*   定义 `dsm_driver_ops`，包含 `alloc_req_id` (O(1) RingBuffer) 和 `check_req_status` (含 `smp_rmb`).
 
 ## Step 3: 纯逻辑核心 (Logic Core)
 **文件**: `master_core/logic_core.c`
+*   实现 `gvm_rpc_call`：包含超时重试、`cpu_relax` 和 `touch_watchdog`。
 
-1.  **Init**: `ops->alloc_large_table(size)` 并 **Check NULL**。
-2.  **Routing**: `get_gateway_id(slave_id)` -> `return slave_id >> GVM_GW_BITS;`
-3.  **Reliability (Thread-Safe RUDP)**:
-    *   实现 `gvm_rpc_call(msg_type, data)`，必须严格遵循以下逻辑以防止死锁和风暴：
-        ```c
-        // A. 原子获取 ID，防止多 vCPU 竞争冲突
-        uint64_t rid = ops->atomic_inc_id();
-        uint64_t timeout = 2000; // 初始超时 2ms
-        int retries = 0;
+## Step 4: 内核后端实现 (Kernel Backend)
+**文件**: `master_core/kernel_backend.c`
+*   **关键**：`k_send_packet` 中实现 `if (k_is_atomic_context()) { ... MSG_DONTWAIT ... }`.
+*   **关键**：`gvm_fault_handler` 中调用 `alloc_page` 后必须 `put_page`.
 
-        // B. 初次发送并启动计时
-        ops->send_packet(..., rid);
-        uint64_t start = ops->get_time_us();
-
-        // C. 等待循环 (自旋等待应答)
-        while (ops->check_req_status(rid) != DONE) {
-            // C1. 喂狗：防止 Linux NMI Watchdog 触发 Panic
-            ops->touch_watchdog();
-            
-            // C2. 超时判定
-            if (ops->time_diff_us(start) > timeout) {
-                // 熔断机制：防止永久卡死
-                if (++retries > 50) { 
-                    ops->log("RPC Timeout: id=%lu, slave down?", rid);
-                    return -EIO; 
-                }
-                
-                // 重传请求
-                ops->send_packet(..., rid);
-                
-                // 拥塞控制：指数退避 (2ms -> 4ms -> ... -> 100ms)
-                timeout *= 2;
-                if (timeout > 100000) timeout = 100000;
-                
-                // 重置计时器
-                start = ops->get_time_us();
-            }
-            // C3. 让出流水线，降低功耗
-            ops->cpu_relax();
-        }
-        return 0;
-        ```
-4.  **Fault Handler**: `gvm_handle_page_fault(gpa)` -> 计算 ID -> 发送 `MSG_MEM_READ`.
-5.  **Stack Safety**:
-    ```c
-    // 必须这样分配 Copyset
-    copyset_t *cp = ops->alloc_packet(sizeof(copyset_t), 0);
-    if (!cp) return;
-    // ... use cp ...
-    ops->free_packet(cp);
-    ```
-
-## Step 4: 内核后端实现与内核构建脚本 (Kernel Backend & Kernel Build Script) - 最关键部分
-**文件**: `master_core/kernel_backend.c`,`master_core/Kbuild`
-
-1.  **Global**: `static struct sockaddr_in gateway_table[GVM_MAX_GATEWAYS];`
-2.  **VM Ops Definition** (Explicit):
-    ```c
-    static const struct vm_operations_struct gvm_vm_ops = {
-        .fault = gvm_fault_handler, // 必须实现此函数调用 ops->handle_page_fault
-    };
-    ```
-3.  **Impl `ioctl`**:
-    *   `switch(cmd) { case IOCTL_SET_GATEWAY: ... }`
-4.  **Impl `mmap`**:
-    *   `vma->vm_ops = &gvm_vm_ops;`
-5.  **Impl `send_packet` (Deadlock & Frag)**:
-    *   **Frag**: `if (len > MTU)` -> Loop slice -> Send.
-    *   **Context**:
-        ```c
-        if (in_atomic() || irqs_disabled()) {
-             while (!try_send_poll_skb(skb)) {
-                 udelay(10);
-                 touch_nmi_watchdog();
-             }
-        } else {
-             kernel_sendmsg(...);
-        }
-        ```
-6.  **Impl RUDP Helpers**:
-    *   `atomic_inc_id`: 使用 `atomic64_inc_return(&global_id_counter)`.
-    *   `get_time_us`: 使用 `ktime_to_us(ktime_get())`.
-    *   `cpu_relax`: 调用内核宏 `cpu_relax()`.
-    *   `check_req_status`: 必须先调用 `smp_rmb()` (读内存屏障) 再读取状态位，防止读取到 CPU 缓存中的陈旧数据。
-
-## Step 5: 用户态后端实现 (User Backend) - 复用逻辑核心代码
-**文件**: `master_core/user_backend.c`, `master_core/main_wrapper.c`, `master_core/Makefile_User`
+## Step 5: 用户态后端实现 (User Backend)
+**文件**: `master_core/user_backend.c`, `master_core/main_wrapper.c`
+*   使用 `pthread` 互斥锁保护请求上下文。
+*   实现 Unix Socket 与 QEMU 通信。
 
 ## Step 6: Slave 守护进程 (Slave daemon)
-**文件**: `slave_daemon/net_uring.c`, `slave_daemon/cpu_executor.c`, `slave_daemon/Makefile`, `master_core/Makefile_User`
+**文件**: `slave_daemon/net_uring.c`, `slave_daemon/cpu_executor.c`
+*   **文件名保持 `net_uring.c`**，但内容实现 **Multi-Threaded `recvmmsg` + `SO_REUSEPORT`**。
+*   实现 CPU 亲和性绑定。
 
 ## Step 7: 控制面工具 (Control Tool)
-**文件**: `ctl_tool/main.c`, `ctl_tool/Makefile`
-1.  **Makefile**: `gcc -o gvm_ctl main.c`.
-2.  **Logic**:
-    *   读取文本文件 `gateway_list.txt` (Line format: `ID IP PORT`).
-    *   使用 `fscanf` 解析每行 `id ip port`.
-    *   打开 `/dev/giantvm`，循环调用 `ioctl(fd, IOCTL_SET_GATEWAY, ...)`.
+**文件**: `ctl_tool/main.c`
 
 ## Step 8: QEMU 5.2.0 适配 (Frontend)
 **文件**: `qemu_patch/accel/giantvm/*`
-
-1.  **Init**: 在 `init_machine` 中 `open("/dev/giantvm", O_RDWR)` 并 `mmap`.
-2.  **CPU Loop**:
-    *   在 `giantvm-cpu.c` 实现 `giantvm_cpu_exec`.
-    *   `ops.schedule_policy(cpu_index)` -> Local(KVM) or Remote(RPC).
+*   `giantvm-uffd.c`: 实现 Worker/Distributor 线程模型处理缺页。
 
 ## Step 9: 优化的网关 (Gateway)
 **文件**: `gateway_service/aggregator.c`
-1.  **Structure**: `struct slave_buffer **buffers;` (二级指针).
-2.  **Init**: `buffers = calloc(GVM_MAX_SLAVES, sizeof(void*));`
-3.  **On-Demand**: `if (!buffers[id]) buffers[id] = malloc(MTU);`
+*   实现 `buffers` 的按需分配 (Lazy Allocation) 和细粒度锁。
 
 ## Step 10: Guest 工具 (Guest Tools)
 **文件**: `guest_tools/win_memory_hint.cpp`
@@ -450,8 +308,7 @@ GiantVM-Frontier-V16/
 
 **执行指令 (Action)**:
 
-请先忽略所有的解释性文本，**直接开始生成** Step 0 到 Step 4 的代码。
-**重点验证**：`kernel_backend.c` 中必须显式定义 `gvm_vm_ops` 结构体，且 `ctl_tool` 不依赖 JSON 库。
+请先忽略所有的解释性文本，**直接开始生成** Step 0 到 Step 10 的代码。
 ```
 
 @@@@@
